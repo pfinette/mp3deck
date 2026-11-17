@@ -205,6 +205,16 @@ impl Deck {
 
     /// Plays track `i` from the start. A file that won't decode is marked and skipped.
     pub fn play(&mut self, i: usize) {
+        self.load(i, None);
+    }
+
+    /// Loads track `i` paused at `at`, so Space resumes there. Used to pick up where the last
+    /// session stopped; a file that won't decode is marked and left stopped.
+    pub fn cue(&mut self, i: usize, at: Duration) {
+        self.load(i, Some(at));
+    }
+
+    fn load(&mut self, i: usize, paused_at: Option<Duration>) {
         let Some(player) = &self.player else { return };
         let mut next = Some(i);
 
@@ -219,18 +229,30 @@ impl Deck {
                         track.duration = dec.total_duration();
                     }
                     self.duration = track.duration;
+                    // `clear` also pauses, so a cued track stays silent while it seeks.
                     player.clear();
                     self.levels.reset();
                     player.set_volume(gain(self.volume));
                     player.append(Metered::new(dec, self.levels.clone()));
-                    player.play();
-                    self.transport = Transport::Playing;
                     self.error = None;
+                    match paused_at {
+                        Some(at) => {
+                            let _ = player.try_seek(at);
+                            self.transport = Transport::Paused;
+                        }
+                        None => {
+                            player.play();
+                            self.transport = Transport::Playing;
+                        }
+                    }
                     return;
                 }
                 Err(e) => {
                     track.failed = true;
                     self.error = Some(e);
+                    if paused_at.is_some() {
+                        break;
+                    }
                     next = self.playlist.next_index(false).filter(|&n| !self.playlist.tracks[n].failed);
                 }
             }

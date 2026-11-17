@@ -26,7 +26,7 @@ Personal use only. Not distributed or notarized.
 - VOLUME is a knob; drag up or down. REPEAT and SHUFFLE are knobs too: click for the next setting, or drag.
 - The window follows the system's light or dark mode.
 - REPEAT is OFF, ONE or ALL. SHUFFLE plays the rest of the list at random, starting from the current track.
-- The playlist, volume, repeat and shuffle persist between launches.
+- The playlist, volume, repeat and shuffle persist between launches. So does the place in the current track: the deck opens paused there, and Space carries on.
 - Playback continues when the window is covered or minimised.
 
 ## Build

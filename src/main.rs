@@ -152,6 +152,9 @@ struct Prefs {
     shuffle: bool,
     playlist: Vec<PathBuf>,
     current: Option<usize>,
+
+    /// Seconds into the current track when the app last saved, 0 when stopped.
+    position: f64,
     layout: u32,
 }
 
@@ -159,7 +162,7 @@ const DEFAULT_VOLUME: f64 = 80.0;
 
 impl Default for Prefs {
     fn default() -> Self {
-        Self { volume: DEFAULT_VOLUME, repeat: Repeat::Off, shuffle: false, playlist: Vec::new(), current: None, layout: 0 }
+        Self { volume: DEFAULT_VOLUME, repeat: Repeat::Off, shuffle: false, playlist: Vec::new(), current: None, position: 0.0, layout: 0 }
     }
 }
 
@@ -259,6 +262,9 @@ impl App {
         deck.playlist.add(saved.clone());
         deck.playlist.current = prefs.current.filter(|&c| c < deck.playlist.tracks.len());
         deck.playlist.set_shuffle(prefs.shuffle);
+        if let Some(c) = deck.playlist.current.filter(|_| prefs.position > 0.0) {
+            deck.cue(c, Duration::from_secs_f64(prefs.position));
+        }
 
         let deck = Arc::new(Mutex::new(deck));
         spawn_watcher(&deck, cc.egui_ctx.clone());
@@ -1089,6 +1095,7 @@ impl eframe::App for App {
             shuffle: self.shuffle,
             playlist: deck.playlist.tracks.iter().map(|t| t.path.clone()).collect(),
             current: deck.playlist.current,
+            position: deck.position().as_secs_f64(),
             layout: LAYOUT,
         };
         eframe::set_value(storage, eframe::APP_KEY, &prefs);
