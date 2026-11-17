@@ -164,18 +164,23 @@ impl Default for Prefs {
 }
 
 /// Meter readings as shown, in dBFS. They read the music before the volume knob, rise at once and
-/// fall slowly, and hold the peak for a moment.
+/// fall slowly, and hold the peak for a moment. `clip` counts down while the signal sits at full scale.
 #[derive(Default)]
 struct Meters {
     rms: [f32; 2],
     peak: [f32; 2],
     peak_age: [f32; 2],
+    clip: [f32; 2],
     last: Option<Instant>,
 }
 
 const FLOOR_DB: f32 = -48.0;
 const FALL_DB_PER_S: f32 = 26.0;
-const PEAK_HOLD_S: f32 = 1.2;
+const PEAK_HOLD_S: f32 = 0.4;
+
+/// Full scale, give or take rounding in the decoder.
+const CLIP: f32 = 0.999;
+const CLIP_HOLD_S: f32 = 0.5;
 
 fn to_db(amplitude: f32) -> f32 {
     if amplitude <= 1e-6 { FLOOR_DB } else { (20.0 * amplitude.log10()).clamp(FLOOR_DB, 0.0) }
@@ -192,6 +197,7 @@ impl Meters {
         let dt = self.last.map_or(0.0, |t| (now - t).as_secs_f32().min(0.1));
         self.last = Some(now);
         for (ch, (rms, peak)) in levels.into_iter().enumerate() {
+            self.clip[ch] = if live && peak >= CLIP { CLIP_HOLD_S } else { (self.clip[ch] - dt).max(0.0) };
             let (rms, peak) = if live { (to_db(rms), to_db(peak)) } else { (FLOOR_DB, FLOOR_DB) };
             self.rms[ch] = if rms > self.rms[ch] { rms } else { (self.rms[ch] - FALL_DB_PER_S * dt).max(rms) };
             if peak >= self.peak[ch] {
@@ -204,7 +210,7 @@ impl Meters {
                 }
             }
         }
-        live || self.rms.iter().chain(&self.peak).any(|&db| db > FLOOR_DB)
+        live || self.rms.iter().chain(&self.peak).any(|&db| db > FLOOR_DB) || self.clip.iter().any(|&c| c > 0.0)
     }
 }
 
@@ -523,7 +529,8 @@ impl App {
         }
     }
 
-    /// Left and right levels as rows of dashes; the held peak is orange.
+    /// Left and right levels as rows of dashes: ink up to the average level, grey up to the peak,
+    /// and the top dash orange while the signal hits full scale.
     fn meters(&self, ui: &mut egui::Ui) {
         let p = palette(ui);
         let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 2.0 * DASH_H + DASH_ROW_GAP), Sense::hover());
@@ -535,11 +542,14 @@ impl App {
             let y = rect.top() + ch as f32 * (DASH_H + DASH_ROW_GAP);
             painter.text(pos2(rect.left(), y + DASH_H / 2.0), Align2::LEFT_CENTER, name, bold(9.0), p.label);
             let (lit, peak) = (at(self.meters.rms[ch]), at(self.meters.peak[ch]));
+            let clipping = self.meters.clip[ch] > 0.0;
             for k in 0..count {
-                let color = if peak > 0 && k + 1 == peak {
+                let color = if clipping && k + 1 == count {
                     LIVE
                 } else if k < lit {
                     p.ink
+                } else if k < peak {
+                    p.label
                 } else {
                     p.dim
                 };
