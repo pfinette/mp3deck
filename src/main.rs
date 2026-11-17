@@ -731,12 +731,14 @@ fn spawn_watcher(deck: &Arc<Mutex<Deck>>, ctx: egui::Context) {
     let weak = Arc::downgrade(deck);
     std::thread::spawn(move || {
         while let Some(deck) = weak.upgrade() {
-            let changed = deck.lock().is_ok_and(|mut d| d.tick());
+            let (changed, playing) = deck.lock().map_or((false, false), |mut d| (d.tick(), d.transport == Transport::Playing));
             drop(deck);
             if changed {
                 ctx.request_repaint();
             }
-            std::thread::sleep(Duration::from_millis(40));
+
+            // Only a playing track can run out, so the thread naps while the deck is idle.
+            std::thread::sleep(Duration::from_millis(if playing { 40 } else { 500 }));
         }
     });
 }
@@ -1043,7 +1045,7 @@ impl eframe::App for App {
         let reading = wave.is_some_and(|w| w.state.load(Ordering::Relaxed) == READING);
         if live || moving {
             ctx.request_repaint_after(FRAME);
-        } else if reading || deck.transport != Transport::Stopped {
+        } else if reading {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
     }
