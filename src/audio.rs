@@ -1,6 +1,8 @@
 //! Playback: the output device, a level meter on the signal path, and the deck that drives both.
 
 use std::fs::File;
+use std::io::BufReader;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -8,6 +10,7 @@ use std::time::Duration;
 use rodio::source::SeekError;
 use rodio::{ChannelCount, Decoder, DeviceSinkBuilder, MixerDeviceSink, Player, Sample, SampleRate, Source};
 
+use crate::ffmpeg::FfmpegSource;
 use crate::{Playlist, Repeat};
 
 /// Loudness of the last few milliseconds per channel, written by the audio thread.
@@ -126,6 +129,37 @@ pub fn open_output() -> Result<(MixerDeviceSink, Player), String> {
     Ok((sink, player))
 }
 
+fn extension(path: &Path) -> String {
+    path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default()
+}
+
+/// The in-process decoder for MP3 and MP4 audio. `None` for other files.
+pub fn open_native(path: &Path) -> Option<Result<Decoder<BufReader<File>>, String>> {
+    let hint = match extension(path).as_str() {
+        "mp3" => "mp3",
+        "m4a" | "mp4" | "m4v" | "mov" => "mp4",
+        _ => return None,
+    };
+    let open = || {
+        let file = File::open(path).map_err(|e| e.to_string())?;
+        let len = file.metadata().map_err(|e| e.to_string())?.len();
+        let builder = Decoder::builder().with_data(BufReader::new(file)).with_byte_len(len).with_seekable(true);
+        builder.with_hint(hint).build().map_err(|e| e.to_string())
+    };
+    Some(open())
+}
+
+/// A decoder for the file. MP3 and plain MP4 audio decode in-process; anything rodio can't read,
+/// such as Opus in MKV, goes through ffmpeg.
+pub fn open_track(path: &Path) -> Result<Box<dyn Source + Send>, String> {
+    match open_native(path) {
+        Some(Ok(decoder)) => return Ok(Box::new(decoder)),
+        Some(Err(e)) if extension(path) == "mp3" => return Err(e),
+        _ => {}
+    }
+    Ok(Box::new(FfmpegSource::open(path)?))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Transport {
     Stopped,
@@ -177,7 +211,7 @@ impl Deck {
         // Each attempt either plays or marks one more track as failed, so this ends.
         while let Some(k) = next {
             let Some(track) = self.playlist.tracks.get_mut(k) else { break };
-            let decoded = File::open(&track.path).map_err(|e| e.to_string()).and_then(|f| Decoder::try_from(f).map_err(|e| e.to_string()));
+            let decoded = open_track(&track.path);
             self.playlist.current = Some(k);
             match decoded {
                 Ok(dec) => {

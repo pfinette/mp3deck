@@ -17,7 +17,7 @@ path = "src/main.rs"
 eframe = { version = "0.37", features = ["persistence"] }
 lofty = "0.25"
 rfd = "0.18"
-rodio = { version = "0.23", default-features = false, features = ["playback", "mp3"] }
+rodio = { version = "0.23", default-features = false, features = ["playback", "mp3", "mp4"] }
 serde = { version = "1", features = ["derive"] }
 
 [profile.release]

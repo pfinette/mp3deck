@@ -1,23 +1,29 @@
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use eframe::egui::text::{LayoutJob, TextFormat, TextWrapping};
 use eframe::egui::{
-    self, Align, Align2, Color32, FontData, FontDefinitions, FontFamily, FontId, Key, Layout, Modifiers, Pos2, Rect, Role,
-    Sense, Stroke, StrokeKind, Theme, WidgetInfo, pos2, vec2,
+    self, Align, Align2, Color32, FontData, FontDefinitions, FontFamily, FontId, Key, Layout, Modifiers, Painter, Pos2, Rect,
+    Role, Sense, Shape, Stroke, Theme, UiBuilder, WidgetInfo, pos2, vec2,
 };
 use mp3deck::audio::{Deck, Transport, open_output};
-use mp3deck::{Meta, Repeat, collect_mp3s, format_time, read_meta};
+use mp3deck::{EXTENSIONS, Meta, Repeat, collect_tracks, format_time, read_meta, wave};
 use serde::{Deserialize, Serialize};
+
+const WIDTH: f32 = 432.0;
+const HEIGHT: f32 = 720.0;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("MP3deck")
-            .with_inner_size([860.0, 600.0])
-            .with_min_inner_size([760.0, 480.0])
+            .with_inner_size([WIDTH, HEIGHT])
+            .with_min_inner_size([WIDTH, 620.0])
+            .with_max_inner_size([640.0, 1600.0])
             .with_drag_and_drop(true)
             .with_fullsize_content_view(true)
             .with_titlebar_shown(false)
@@ -27,112 +33,116 @@ fn main() -> eframe::Result {
     eframe::run_native("MP3deck", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
 }
 
-/// The one signal color: the music's level.
-const ACCENT: Color32 = Color32::from_rgb(0xFF, 0xB0, 0x20);
+// One flat ground, ink, a dim tone for whatever is not there yet, and one orange for what is live:
+// the playhead, the playing track, the arcs of the knobs.
 
-/// A cream faceplate with recessed screens, after a tape deck.
 struct Palette {
-    face: Color32,
-    groove: Color32,
+    ground: Color32,
     ink: Color32,
     dim: Color32,
-    screen: Color32,
-    screen_edge: Color32,
-    screen_text: Color32,
-    screen_dim: Color32,
-    seg_off: Color32,
-    seg_lit: Color32,
-    row_hover: Color32,
-    row_selected: Color32,
-    error: Color32,
+    label: Color32,
+    select: Color32,
+    hover: Color32,
 }
 
 const LIGHT: Palette = Palette {
-    face: Color32::from_rgb(0xE3, 0xE0, 0xCC),
-    groove: Color32::from_rgb(0xC9, 0xC5, 0xAE),
-    ink: Color32::from_rgb(0x1B, 0x1B, 0x1A),
-
-    // Darker than the skill's default dim, which fails 4.5:1 on cream.
-    dim: Color32::from_rgb(0x61, 0x5E, 0x57),
-    screen: Color32::from_rgb(0x1A, 0x1B, 0x1D),
-    screen_edge: Color32::from_rgb(0x9C, 0x98, 0x90),
-    screen_text: Color32::from_rgb(0xE6, 0xE4, 0xDE),
-    screen_dim: Color32::from_rgb(0x82, 0x84, 0x88),
-    seg_off: Color32::from_rgb(0x2C, 0x2E, 0x32),
-    seg_lit: Color32::from_rgb(0x9A, 0x9D, 0xA3),
-    row_hover: Color32::from_rgb(0x22, 0x24, 0x28),
-    row_selected: Color32::from_rgb(0x2A, 0x2C, 0x31),
-    error: Color32::from_rgb(0xFF, 0x6B, 0x5B),
+    ground: Color32::from_rgb(0xEF, 0xEE, 0xE9),
+    ink: Color32::from_rgb(0x12, 0x12, 0x12),
+    dim: Color32::from_rgb(0xD3, 0xD1, 0xC8),
+    label: Color32::from_rgb(0x6C, 0x6A, 0x64),
+    select: Color32::from_rgb(0xE3, 0xE1, 0xD9),
+    hover: Color32::from_rgb(0xE9, 0xE8, 0xE1),
 };
 
 const DARK: Palette = Palette {
-    face: Color32::from_rgb(0x2B, 0x2B, 0x2A),
-    groove: Color32::from_rgb(0x44, 0x44, 0x42),
+    ground: Color32::from_rgb(0x15, 0x15, 0x14),
     ink: Color32::from_rgb(0xEC, 0xEA, 0xE4),
-    dim: Color32::from_rgb(0x9A, 0x97, 0x8F),
-    screen: Color32::from_rgb(0x17, 0x18, 0x1A),
-    screen_edge: Color32::from_rgb(0x0E, 0x0E, 0x0F),
-    ..LIGHT
+    dim: Color32::from_rgb(0x3B, 0x3A, 0x37),
+    label: Color32::from_rgb(0x8F, 0x8D, 0x86),
+    select: Color32::from_rgb(0x26, 0x25, 0x23),
+    hover: Color32::from_rgb(0x1E, 0x1D, 0x1C),
 };
+
+const LIVE: Color32 = Color32::from_rgb(0xEE, 0x4F, 0x17);
 
 fn palette(ui: &egui::Ui) -> &'static Palette {
     if ui.visuals().dark_mode { &DARK } else { &LIGHT }
 }
 
-/// DIN for printed labels, SF Mono for screens, SF Pro for menus and tooltips.
-fn din(size: f32) -> FontId {
-    FontId::new(size, FontFamily::Name("din".into()))
+/// Helvetica Neue in three cuts. Its figures are tabular, so running times don't jitter.
+fn bold(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name("bold".into()))
 }
 
-fn mono(size: f32) -> FontId {
-    FontId::monospace(size)
+fn medium(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name("medium".into()))
 }
 
-/// Text with extra letter spacing, as printed on a faceplate.
+fn regular(size: f32) -> FontId {
+    FontId::proportional(size)
+}
+
+/// Text with extra letter spacing, for the small labels.
 fn tracked(text: impl Into<String>, font: FontId, spacing: f32, color: Color32) -> LayoutJob {
     LayoutJob::single_section(text.into(), TextFormat { font_id: font, extra_letter_spacing: spacing, color, ..Default::default() })
 }
 
-/// One line of text cut to `width` with an ellipsis.
-fn one_line(mut job: LayoutJob, width: f32) -> LayoutJob {
-    job.wrap = TextWrapping { max_width: width.max(10.0), max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
+/// Text cut to `rows` lines of `width` with an ellipsis.
+fn fitted(mut job: LayoutJob, width: f32, rows: usize) -> LayoutJob {
+    job.wrap = TextWrapping { max_width: width.max(10.0), max_rows: rows, break_anywhere: rows == 1, overflow_character: Some('…') };
     job
 }
 
 fn install_style(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
-
-    // Each family falls back to egui's own fonts when a system font is missing.
     let fallback = fonts.families[&FontFamily::Proportional].clone();
-    fonts.families.insert(FontFamily::Name("din".into()), fallback);
-    for (name, path, family) in [
-        ("SF Pro", "/System/Library/Fonts/SFNS.ttf", FontFamily::Proportional),
-        ("SF Mono", "/System/Library/Fonts/SFNSMono.ttf", FontFamily::Monospace),
-        ("DIN", "/System/Library/Fonts/Supplemental/DIN Alternate Bold.ttf", FontFamily::Name("din".into())),
-    ] {
-        if let Ok(bytes) = std::fs::read(path) {
-            fonts.font_data.insert(name.into(), Arc::new(FontData::from_owned(bytes)));
+    for name in ["bold", "medium"] {
+        fonts.families.insert(FontFamily::Name(name.into()), fallback.clone());
+    }
+
+    // One read of the collection, shared by the three cuts.
+    if let Ok(bytes) = std::fs::read("/System/Library/Fonts/HelveticaNeue.ttc") {
+        let bytes: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+        for (name, index, family) in [
+            ("Helvetica Neue", 0, FontFamily::Proportional),
+            ("Helvetica Neue Bold", 1, FontFamily::Name("bold".into())),
+            ("Helvetica Neue Medium", 10, FontFamily::Name("medium".into())),
+        ] {
+            let mut data = FontData::from_static(bytes);
+            data.index = index;
+            fonts.font_data.insert(name.into(), Arc::new(data));
             fonts.families.entry(family).or_default().insert(0, name.into());
         }
     }
     ctx.set_fonts(fonts);
 
-    for (theme, p) in [(Theme::Dark, &DARK), (Theme::Light, &LIGHT)] {
+    for (theme, p) in [(Theme::Light, &LIGHT), (Theme::Dark, &DARK)] {
         ctx.style_mut_of(theme, |style| {
             style.spacing.scroll = egui::style::ScrollStyle::floating();
             style.interaction.tooltip_delay = 0.6;
             style.interaction.selectable_labels = false;
             let v = &mut style.visuals;
-            v.panel_fill = p.face;
-            v.window_fill = p.face;
-            v.selection.bg_fill = ACCENT;
+            v.panel_fill = p.ground;
+            v.window_fill = p.ground;
+            v.window_stroke = Stroke::new(1.0, p.dim);
+            v.selection.bg_fill = LIVE;
             v.selection.stroke.color = p.ink;
-            v.widgets.noninteractive.bg_stroke.color = p.groove;
             v.widgets.noninteractive.fg_stroke.color = p.ink;
+            v.widgets.noninteractive.bg_stroke.color = p.dim;
             v.widgets.inactive.fg_stroke.color = p.ink;
+            v.widgets.inactive.bg_fill = p.dim;
+            v.widgets.hovered.fg_stroke.color = p.ink;
+            v.widgets.hovered.weak_bg_fill = p.select;
+            v.widgets.hovered.bg_fill = p.label;
+            v.widgets.active.fg_stroke.color = p.ink;
+            v.widgets.active.weak_bg_fill = p.dim;
+            v.widgets.active.bg_fill = p.label;
         });
     }
 }
+
+/// Bumped when the default window size changes, so an old saved size is replaced once.
+const LAYOUT: u32 = 3;
 
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
@@ -142,18 +152,19 @@ struct Prefs {
     shuffle: bool,
     playlist: Vec<PathBuf>,
     current: Option<usize>,
+    layout: u32,
 }
 
 const DEFAULT_VOLUME: f64 = 80.0;
 
 impl Default for Prefs {
     fn default() -> Self {
-        Self { volume: DEFAULT_VOLUME, repeat: Repeat::Off, shuffle: false, playlist: Vec::new(), current: None }
+        Self { volume: DEFAULT_VOLUME, repeat: Repeat::Off, shuffle: false, playlist: Vec::new(), current: None, layout: 0 }
     }
 }
 
-/// Meter readings as shown, in dBFS. They read the music before the volume knob, as a deck's
-/// meters read the tape, and rise at once and fall slowly, like a VU meter.
+/// Meter readings as shown, in dBFS. They read the music before the volume knob, rise at once and
+/// fall slowly, and hold the peak for a moment.
 #[derive(Default)]
 struct Meters {
     rms: [f32; 2],
@@ -197,6 +208,17 @@ impl Meters {
     }
 }
 
+/// A track's waveform overview, filled in by a background thread.
+#[derive(Default)]
+struct Wave {
+    windows: Mutex<Vec<f32>>,
+    state: AtomicU8,
+}
+
+const READING: u8 = 0;
+const READ: u8 = 1;
+const ABANDONED: u8 = 2;
+
 struct App {
     deck: Arc<Mutex<Deck>>,
 
@@ -208,19 +230,32 @@ struct App {
     selected: Option<usize>,
     meters: Meters,
 
-    /// Where the seek bar is being dragged to, as a fraction of the track.
+    waves: HashMap<PathBuf, Arc<Wave>>,
+
+    /// Bumped for each new waveform job; older jobs see the change and stop.
+    wave_job: Arc<AtomicU64>,
+
+    /// Where the waveform is being dragged to, as a fraction of the track.
     scrub: Option<f32>,
+
+    /// Drag travel not yet spent on a step of a stepped knob.
+    knob_travel: f32,
     volume: f64,
     shuffle: bool,
 
     /// Paths given on the command line, added on the first frame.
     launch_paths: Vec<PathBuf>,
+
+    /// Set when the saved window size predates this layout.
+    reset_size: bool,
 }
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         install_style(&cc.egui_ctx);
-        let prefs: Prefs = cc.storage.and_then(|s| eframe::get_value(s, eframe::APP_KEY)).unwrap_or_default();
+        let prefs: Option<Prefs> = cc.storage.and_then(|s| eframe::get_value(s, eframe::APP_KEY));
+        let reset_size = prefs.as_ref().is_some_and(|p| p.layout < LAYOUT);
+        let prefs = prefs.unwrap_or_default();
 
         let (output, player) = match open_output() {
             Ok((sink, player)) => (Some(sink), Some(player)),
@@ -248,16 +283,20 @@ impl App {
             meta_rx,
             selected: None,
             meters: Meters::new(),
+            waves: HashMap::new(),
+            wave_job: Arc::default(),
             scrub: None,
+            knob_travel: 0.0,
             volume: prefs.volume,
             shuffle: prefs.shuffle,
             launch_paths: std::env::args_os().skip(1).map(PathBuf::from).collect(),
+            reset_size,
         }
     }
 
-    /// Adds MP3s from files and folders. Starts playing when the deck was idle.
+    /// Adds files and folders. Starts playing when the deck was idle.
     fn add(&mut self, paths: &[PathBuf], deck: &mut Deck, ctx: &egui::Context) {
-        let files = collect_mp3s(paths);
+        let files = collect_tracks(paths);
         if files.is_empty() {
             return;
         }
@@ -270,21 +309,49 @@ impl App {
     }
 
     fn open_dialog(&mut self, deck: &mut Deck, ctx: &egui::Context) {
-        if let Some(files) = rfd::FileDialog::new().set_title("Add MP3s").add_filter("MP3", &["mp3", "MP3"]).pick_files() {
+        let dialog = rfd::FileDialog::new().set_title("Load Tracks").add_filter("MP3, MP4 and MKV", &EXTENSIONS);
+        if let Some(files) = dialog.pick_files() {
             self.add(&files, deck, ctx);
         }
     }
 
+    fn clear(&mut self, deck: &mut Deck) {
+        deck.clear();
+        self.selected = None;
+    }
+
+    /// Space or the play key: start the selection when stopped, otherwise pause or resume.
+    fn play_pause(&self, deck: &mut Deck) {
+        match (deck.transport, self.selected) {
+            (Transport::Stopped, Some(i)) if i < deck.playlist.tracks.len() => deck.play(i),
+            _ => deck.toggle(),
+        }
+    }
+
+    /// The waveform of `path`, starting a reader when there is none yet.
+    fn wave(&mut self, path: &Path, ctx: &egui::Context) -> Arc<Wave> {
+        if let Some(w) = self.waves.get(path).filter(|w| w.state.load(Ordering::Relaxed) != ABANDONED) {
+            return w.clone();
+        }
+        let w = Arc::new(Wave::default());
+        self.waves.insert(path.to_owned(), w.clone());
+        let job = self.wave_job.fetch_add(1, Ordering::Relaxed) + 1;
+        let (latest, ctx, path, out) = (self.wave_job.clone(), ctx.clone(), path.to_owned(), w.clone());
+        std::thread::spawn(move || {
+            let read = wave::analyze(&path, &out.windows, &|| latest.load(Ordering::Relaxed) == job);
+            out.state.store(if read { READ } else { ABANDONED }, Ordering::Relaxed);
+            ctx.request_repaint();
+        });
+        w
+    }
+
     fn keys(&mut self, deck: &mut Deck, ctx: &egui::Context) {
-        // Consumed first, so Space never also presses a focused button.
+        // Consumed first, so Space never also presses a focused control.
         let pressed = |key: Key, mods: Modifiers| ctx.input_mut(|i| i.consume_key(mods, key));
         let n = deck.playlist.tracks.len();
 
         if pressed(Key::Space, Modifiers::NONE) {
-            match (deck.transport, self.selected) {
-                (Transport::Stopped, Some(i)) if i < n => deck.play(i),
-                _ => deck.toggle(),
-            }
+            self.play_pause(deck);
         }
         if pressed(Key::O, Modifiers::COMMAND) {
             self.open_dialog(deck, ctx);
@@ -317,11 +384,9 @@ impl App {
         }
     }
 
-    /// Wordmark and status display, in the title bar beside the traffic lights.
+    /// The title bar: drag to move, double-click to zoom. The deck's state sits on the right.
     fn title_strip(&self, ui: &mut egui::Ui, deck: &Deck) {
         let p = palette(ui);
-
-        // The strip is the title bar: drag to move, double-click to zoom.
         let bar = Rect::from_min_max(pos2(0.0, 0.0), pos2(ui.ctx().content_rect().right(), ui.max_rect().bottom()));
         let background = ui.interact(bar, ui.scope_id().with("titlebar"), Sense::click_and_drag());
         if background.drag_started() {
@@ -335,242 +400,327 @@ impl App {
         let n = deck.playlist.tracks.len();
         let at = deck.playlist.current.map_or(0, |c| c + 1);
         let (status, color) = if !deck.has_output() {
-            ("NO AUDIO OUTPUT".to_owned(), p.error)
+            ("NO AUDIO OUTPUT".to_owned(), LIVE)
         } else if deck.error.is_some() && deck.transport == Transport::Stopped {
-            ("CAN'T PLAY".to_owned(), p.error)
+            ("CAN'T PLAY".to_owned(), LIVE)
         } else {
-            let s = match (deck.transport, n) {
-                (_, 0) => "READY".to_owned(),
-                (Transport::Playing, _) => format!("PLAYING {at}/{n}"),
-                (Transport::Paused, _) => format!("PAUSED {at}/{n}"),
-                (Transport::Stopped, _) => format!("STOPPED {at}/{n}"),
-            };
-            (s, p.screen_text)
+            match (deck.transport, n) {
+                (_, 0) => ("READY".to_owned(), p.label),
+                (Transport::Playing, _) => (format!("PLAYING {at}/{n}"), LIVE),
+                (Transport::Paused, _) => (format!("PAUSED {at}/{n}"), p.ink),
+                (Transport::Stopped, _) => (format!("STOPPED {at}/{n}"), p.label),
+            }
         };
-
-        ui.horizontal_centered(|ui| {
-            ui.label(tracked("MP3DECK", din(15.0), 3.0, p.ink));
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| lcd_text(ui, &status, color, p));
-        });
+        let r = ui.max_rect();
+        let g = ui.painter().layout_job(tracked(status, bold(10.0), 1.2, color));
+        ui.painter().galley(pos2(r.right() - g.size().x, r.center().y - g.size().y / 2.0), g, color);
     }
 
-    /// The upper screen: time, level meters, title and the seek bar.
-    fn display(&mut self, ui: &mut egui::Ui, deck: &mut Deck) {
+    /// The track number in the gutter, the title in large bold type, and one line under it.
+    fn header(&self, ui: &mut egui::Ui, deck: &Deck, hovering: bool) {
         let p = palette(ui);
-        screen_frame(p, false).show(ui, |ui| {
-            let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 112.0), Sense::hover());
-            let painter = ui.painter_at(rect.expand(4.0));
-            let track = deck.playlist.current.and_then(|c| deck.playlist.tracks.get(c)).cloned();
-            let duration = deck.duration.filter(|d| !d.is_zero());
-            let position = deck.position();
+        let width = ui.available_width() - GUTTER;
+        let track = deck.playlist.current.and_then(|c| deck.playlist.tracks.get(c));
 
-            // Time: elapsed large, then remaining and total.
-            let shown = match (self.scrub, duration) {
-                (Some(f), Some(d)) => d.mul_f32(f),
-                _ => position,
-            };
-            let (time, time_color) = match track {
-                Some(_) => (format_time(shown), p.screen_text),
-                None => ("0:00".to_owned(), p.screen_dim),
-            };
-            painter.text(rect.left_top(), Align2::LEFT_TOP, time, mono(32.0), time_color);
-            if let Some(d) = duration {
-                let rest = format!("−{}  /  {}", format_time(d.saturating_sub(shown)), format_time(d));
-                painter.text(rect.left_top() + vec2(2.0, 42.0), Align2::LEFT_TOP, rest, mono(11.0), p.screen_dim);
+        let title = if hovering {
+            "Release to load".to_owned()
+        } else if let Some(t) = track {
+            t.title.clone()
+        } else {
+            "Drop music here".to_owned()
+        };
+        let (detail, detail_color) = match (&deck.error, deck.transport, track) {
+            (Some(e), Transport::Stopped, _) => (format!("Can't play: {e}"), LIVE),
+            (_, _, None) => ("MP3, MP4 or MKV files and folders, or ⌘O to choose.".to_owned(), p.label),
+            (_, _, Some(t)) => {
+                let folder = || t.path.parent().and_then(|p| p.file_name()).map(|f| f.to_string_lossy().into_owned());
+                (t.artist.clone().or_else(folder).unwrap_or_default(), p.label)
             }
+        };
+        let painter = ui.painter();
+        let title = painter.layout_job(fitted(LayoutJob::simple(title, bold(TITLE), p.ink, width), width, 2));
+        let detail = painter.layout_job(fitted(LayoutJob::simple_singleline(detail, regular(13.0), detail_color), width, 1));
+        let height = title.size().y + 6.0 + detail.size().y;
+        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
 
-            // Level meters, left and right.
-            let meter_left = rect.left() + 190.0;
-            let meter = Rect::from_min_max(pos2(meter_left + 18.0, rect.top() + 4.0), pos2(rect.right(), rect.top() + 44.0));
-            for (ch, label) in ["L", "R"].into_iter().enumerate() {
-                let y = meter.top() + ch as f32 * 18.0;
-                painter.text(pos2(meter_left, y + 5.0), Align2::LEFT_CENTER, label, mono(10.0), p.screen_dim);
-                let bar = Rect::from_min_size(pos2(meter.left(), y), vec2(meter.width(), 10.0));
-                level_meter(&painter, bar, self.meters.rms[ch], self.meters.peak[ch], p);
-            }
-            for db in [-40, -30, -20, -10, -6, -3, 0] {
-                let x = meter.left() + meter.width() * (db as f32 - FLOOR_DB) / -FLOOR_DB;
-                let align = if db == 0 { Align2::RIGHT_TOP } else { Align2::CENTER_TOP };
-                painter.text(pos2(x, meter.top() + 31.0), align, db.to_string(), mono(9.0), p.screen_dim);
-            }
+        let painter = ui.painter();
+        if let (Some(c), false) = (deck.playlist.current, hovering) {
+            painter.text(rect.left_top(), Align2::LEFT_TOP, (c + 1).to_string(), bold(TITLE), LIVE);
+        }
+        let text_left = rect.left() + GUTTER;
+        let title_height = title.size().y;
+        painter.galley(pos2(text_left, rect.top()), title, p.ink);
+        painter.galley(pos2(text_left, rect.top() + title_height + 6.0), detail, detail_color);
+    }
 
-            // Title and artist.
-            let title_y = rect.top() + 70.0;
-            if let Some(t) = &track {
-                let mut job = LayoutJob::default();
-                job.append(&t.title, 0.0, TextFormat::simple(mono(13.0), p.screen_text));
-                if let Some(a) = &t.artist {
-                    job.append(a, 14.0, TextFormat::simple(mono(13.0), p.screen_dim));
-                }
-                let g = painter.layout_job(one_line(job, rect.width()));
-                painter.galley(pos2(rect.left(), title_y), g, p.screen_text);
-            } else {
-                painter.text(pos2(rect.left(), title_y), Align2::LEFT_TOP, "NO TRACK", mono(13.0), p.screen_dim);
+    /// The track's waveform: played in ink, the rest dim, the playhead in orange. Click or drag to jump.
+    fn waveform(&mut self, ui: &mut egui::Ui, deck: &mut Deck, wave: Option<&Wave>) {
+        let p = palette(ui);
+        let (rect, hit) = ui.allocate_exact_size(vec2(ui.available_width(), WAVE_H), Sense::click_and_drag());
+        let loaded = deck.playlist.current.is_some();
+        let duration = deck.duration.filter(|d| !d.is_zero() && loaded);
+        let fraction_at = |pos: Pos2| ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+        if let (Some(d), Some(pos)) = (duration, hit.interact_pointer_pos()) {
+            if hit.dragged() || hit.is_pointer_button_down_on() {
+                self.scrub = Some(fraction_at(pos));
             }
-
-            // Seek bar: drag or click to jump.
-            let bar = Rect::from_min_max(pos2(rect.left(), rect.bottom() - 9.0), pos2(rect.right(), rect.bottom()));
-            let hit = ui.interact(bar.expand2(vec2(0.0, 6.0)), ui.scope_id().with("seek"), Sense::click_and_drag());
-            let fraction_at = |pos: Pos2| ((pos.x - bar.left()) / bar.width()).clamp(0.0, 1.0);
-            if let (Some(d), Some(pos)) = (duration, hit.interact_pointer_pos()) {
-                if hit.dragged() || hit.is_pointer_button_down_on() {
-                    self.scrub = Some(fraction_at(pos));
-                }
-                if hit.drag_stopped() || hit.clicked() {
-                    deck.seek(d.mul_f32(fraction_at(pos)));
-                    self.scrub = None;
-                }
-            }
-            if !hit.is_pointer_button_down_on() && !hit.dragged() {
+            if hit.drag_stopped() || hit.clicked() {
+                deck.seek(d.mul_f32(fraction_at(pos)));
                 self.scrub = None;
             }
-            let played = match (self.scrub, duration) {
-                (Some(f), _) => f,
-                (None, Some(d)) => (position.as_secs_f32() / d.as_secs_f32()).clamp(0.0, 1.0),
-                _ => 0.0,
-            };
-            seek_bar(&painter, bar, played, track.is_some(), p);
-            let tip = duration.zip(hit.hover_pos()).map(|(d, pos)| format_time(d.mul_f32(fraction_at(pos))));
-            let hit = match tip {
-                Some(t) => hit.on_hover_text_at_pointer(t),
-                None => hit,
-            };
-            hit.widget_info(|| WidgetInfo::slider(duration.is_some(), (played * 100.0).round() as f64, "Position"));
-        });
+        }
+        if !hit.is_pointer_button_down_on() && !hit.dragged() {
+            self.scrub = None;
+        }
+        let position = match (self.scrub, duration) {
+            (Some(f), Some(d)) => d.mul_f32(f),
+            _ => deck.position(),
+        };
+        let played = duration.map_or(0.0, |d| (position.as_secs_f32() / d.as_secs_f32()).clamp(0.0, 1.0));
+
+        // One bar per few points, each the loudest stretch it covers. Bars not read yet are dots.
+        let windows = wave.map(|w| w.windows.lock().map(|v| v.clone()).unwrap_or_default()).unwrap_or_default();
+        let expected = duration.map_or(windows.len(), |d| (d.as_secs_f32() * wave::RATE as f32).ceil() as usize).max(1);
+        let loudest = windows.iter().copied().fold(0.0f32, f32::max).max(1e-4);
+        let count = ((rect.width() + BAR_GAP) / (BAR + BAR_GAP)).floor() as usize;
+        let painter = ui.painter_at(rect.expand(6.0));
+        let cy = rect.center().y;
+        for k in 0..count {
+            let x = rect.left() + k as f32 * (BAR + BAR_GAP);
+            let color = if loaded && (x + BAR / 2.0 - rect.left()) / rect.width() < played { p.ink } else { p.dim };
+            let (from, to) = (k * expected / count, ((k + 1) * expected / count).max(k * expected / count + 1));
+            if from < windows.len() {
+                let level = windows[from..to.min(windows.len())].iter().copied().fold(0.0f32, f32::max) / loudest;
+                let h = (level * rect.height()).max(2.0);
+                painter.rect_filled(Rect::from_min_size(pos2(x, cy - h / 2.0), vec2(BAR, h)), 0.0, color);
+            } else {
+                painter.rect_filled(Rect::from_center_size(pos2(x + BAR / 2.0, cy), vec2(2.0, 2.0)), 0.0, color);
+            }
+        }
+        if loaded {
+            let x = rect.left() + rect.width() * played;
+            painter.vline(x, rect.y_range().expand(5.0), Stroke::new(2.0, LIVE));
+        }
+
+        let tip = duration.zip(hit.hover_pos()).map(|(d, pos)| format_time(d.mul_f32(fraction_at(pos))));
+        let hit = match tip {
+            Some(t) => hit.on_hover_text_at_pointer(t),
+            None => hit,
+        };
+        hit.widget_info(|| WidgetInfo::slider(duration.is_some(), (played * 100.0).round() as f64, "Position"));
+
+        // Elapsed under the left end, time left under the right.
+        ui.add_space(10.0);
+        let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 14.0), Sense::hover());
+        let painter = ui.painter();
+        if loaded {
+            painter.text(row.left_center(), Align2::LEFT_CENTER, format_time(position), medium(12.0), p.ink);
+        }
+        if let Some(d) = duration {
+            let rest = format!("−{}", format_time(d.saturating_sub(position)));
+            painter.text(row.right_center(), Align2::RIGHT_CENTER, rest, medium(12.0), p.label);
+        }
     }
 
-    /// The lower screen: the playlist as tracks, or what to do when it's empty.
-    fn playlist(&mut self, ui: &mut egui::Ui, deck: &mut Deck, hovering: bool) {
+    /// Left and right levels as rows of dashes; the held peak is orange.
+    fn meters(&self, ui: &mut egui::Ui) {
         let p = palette(ui);
-        screen_frame(p, hovering).show(ui, |ui| {
-            ui.set_min_size(ui.available_size());
-            let r = ui.max_rect();
-            if deck.playlist.tracks.is_empty() {
-                let title = if hovering { "RELEASE TO LOAD" } else { "DROP MP3S OR FOLDERS" };
-                let color = if hovering { ACCENT } else { p.screen_text };
-                let g = ui.painter().layout_job(tracked(title, mono(15.0), 2.0, color));
-                ui.painter().galley(r.center() - vec2(g.size().x / 2.0, 22.0), g, color);
-                let hint = if deck.has_output() { "Or press ⌘O to choose files. Space plays and pauses." } else { "No audio output was found." };
-                ui.painter().text(r.center() + vec2(0.0, 14.0), Align2::CENTER_CENTER, hint, mono(11.0), p.screen_dim);
-                return;
+        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 2.0 * DASH_H + DASH_ROW_GAP), Sense::hover());
+        let painter = ui.painter();
+        let left = rect.left() + GUTTER;
+        let count = ((rect.right() - left + DASH_GAP) / (DASH_W + DASH_GAP)).floor() as usize;
+        let at = |db: f32| (((db - FLOOR_DB) / -FLOOR_DB) * count as f32).round() as usize;
+        for (ch, name) in ["L", "R"].into_iter().enumerate() {
+            let y = rect.top() + ch as f32 * (DASH_H + DASH_ROW_GAP);
+            painter.text(pos2(rect.left(), y + DASH_H / 2.0), Align2::LEFT_CENTER, name, bold(9.0), p.label);
+            let (lit, peak) = (at(self.meters.rms[ch]), at(self.meters.peak[ch]));
+            for k in 0..count {
+                let color = if peak > 0 && k + 1 == peak {
+                    LIVE
+                } else if k < lit {
+                    p.ink
+                } else {
+                    p.dim
+                };
+                let x = left + k as f32 * (DASH_W + DASH_GAP);
+                painter.rect_filled(Rect::from_min_size(pos2(x, y), vec2(DASH_W, DASH_H)), 0.0, color);
             }
-
-            let longest = deck.playlist.tracks.iter().filter_map(|t| t.duration).max().unwrap_or(Duration::from_secs(1));
-            let position = deck.position();
-            let mut action = None;
-            let n = deck.playlist.tracks.len();
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, ROW_HEIGHT, n, |ui, range| {
-                for i in range {
-                    let row = TrackRow {
-                        index: i,
-                        track: &deck.playlist.tracks[i],
-                        current: deck.playlist.current == Some(i),
-                        selected: self.selected == Some(i),
-                        transport: deck.transport,
-                        position,
-                        longest,
-                    };
-                    if let Some(a) = track_row(ui, &row) {
-                        action = Some((i, a));
-                    }
-                }
-            });
-
-            match action {
-                Some((i, RowAction::Select)) => self.selected = Some(i),
-                Some((i, RowAction::Play)) => {
-                    self.selected = Some(i);
-                    deck.play(i);
-                }
-                Some((i, RowAction::Remove)) => {
-                    deck.remove(i);
-                    self.selected = None;
-                }
-                Some((i, RowAction::Reveal)) => {
-                    let _ = std::process::Command::new("open").arg("-R").arg(&deck.playlist.tracks[i].path).spawn();
-                }
-                None => {}
-            }
-
-            if hovering {
-                let veil = Color32::from_rgba_unmultiplied(p.screen.r(), p.screen.g(), p.screen.b(), 220);
-                ui.painter().rect_filled(r, 4.0, veil);
-                let g = ui.painter().layout_job(tracked("RELEASE TO ADD", mono(15.0), 2.0, ACCENT));
-                ui.painter().galley(r.center() - g.size() / 2.0, g, ACCENT);
-            }
-        });
+        }
     }
 
-    /// Hardware controls along the bottom of the faceplate.
-    fn control_row(&mut self, ui: &mut egui::Ui, deck: &mut Deck) {
+    /// Transport icons. The deck's state is underlined: orange while playing.
+    fn transport(&mut self, ui: &mut egui::Ui, deck: &mut Deck) {
         let has_tracks = !deck.playlist.tracks.is_empty();
         let mut load = false;
-        let mut clear = false;
+        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), ICON_BOX.y), Sense::hover());
+        let mut ui = ui.new_child(UiBuilder::new().max_rect(rect).layout(Layout::left_to_right(Align::Min)));
+        ui.spacing_mut().item_spacing.x = 4.0;
+        // The first icon's glyph lines up with the gutter's left edge.
+        ui.add_space(-(ICON_BOX.x - 18.0) / 2.0);
 
-        ui.horizontal(|ui| {
-            control(ui, TRANSPORT_WIDTH, "TRANSPORT", |ui| {
-                ui.add_space(12.0);
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = KEY_GAP;
-                    if transport_key(ui, KeyIcon::Prev, false, has_tracks, "Previous (⌘←)") {
-                        deck.prev();
-                    }
-                    let playing = deck.transport == Transport::Playing;
-                    let icon = if playing { KeyIcon::Pause } else { KeyIcon::Play };
-                    if transport_key(ui, icon, playing, has_tracks, if playing { "Pause (Space)" } else { "Play (Space)" }) {
-                        match (deck.transport, self.selected) {
-                            (Transport::Stopped, Some(i)) if i < deck.playlist.tracks.len() => deck.play(i),
-                            _ => deck.toggle(),
-                        }
-                    }
-                    if transport_key(ui, KeyIcon::Stop, false, deck.transport != Transport::Stopped, "Stop") {
-                        deck.stop();
-                    }
-                    if transport_key(ui, KeyIcon::Next, false, has_tracks, "Next (⌘→)") {
-                        deck.next();
-                    }
-                });
-            });
-            ui.add_space(24.0);
-            control(ui, 3.0 * REPEAT_SEGMENT, "REPEAT", |ui| {
-                ui.add_space(15.0);
-                let mut repeat = deck.playlist.repeat;
-                repeat_switch(ui, &mut repeat);
-                deck.set_repeat(repeat);
-            });
-            ui.add_space(24.0);
-            control(ui, 92.0, "SHUFFLE", |ui| {
-                ui.add_space(17.0);
-                if toggle_switch(ui, self.shuffle, "Shuffle") {
-                    self.shuffle = !self.shuffle;
-                    deck.playlist.set_shuffle(self.shuffle);
-                }
-            });
-            ui.add_space(20.0);
-            control(ui, 64.0, "VOLUME", |ui| {
-                if knob(ui, &mut self.volume, 0.0..=100.0, DEFAULT_VOLUME) {
-                    deck.set_volume((self.volume / 100.0) as f32);
-                }
-            });
-            ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
-                control(ui, 64.0, "", |ui| {
-                    ui.add_space(15.0);
-                    clear = hardware_button(ui, "CLEAR", has_tracks, "Empty the playlist");
-                });
-                ui.add_space(12.0);
-                control(ui, 64.0, "⌘O", |ui| {
-                    ui.add_space(15.0);
-                    load = hardware_button(ui, "LOAD", deck.has_output(), "Add MP3s to the playlist");
-                });
-            });
+        let state = deck.transport;
+        if icon_button(&mut ui, Icon::Prev, None, has_tracks, "Previous (⌘←)") {
+            deck.prev();
+        }
+        let mark = (state == Transport::Playing).then_some(LIVE);
+        if icon_button(&mut ui, Icon::Play, mark, has_tracks, "Play (Space)") && state != Transport::Playing {
+            self.play_pause(deck);
+        }
+        let mark = (state == Transport::Paused).then_some(palette(&ui).ink);
+        if icon_button(&mut ui, Icon::Pause, mark, state != Transport::Stopped, "Pause (Space)") {
+            self.play_pause(deck);
+        }
+        if icon_button(&mut ui, Icon::Stop, None, state != Transport::Stopped, "Stop") {
+            deck.stop();
+        }
+        if icon_button(&mut ui, Icon::Next, None, has_tracks, "Next (⌘→)") {
+            deck.next();
+        }
+        ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+            ui.add_space(-(ICON_BOX.x - 20.0) / 2.0);
+            load = icon_button(ui, Icon::Folder, None, deck.has_output(), "Load tracks (⌘O)");
         });
-
         if load {
             self.open_dialog(deck, ui.ctx());
         }
-        if clear {
-            deck.clear();
-            self.selected = None;
+    }
+
+    /// Three knobs, as on fm1's pages: volume, repeat and shuffle.
+    fn knobs(&mut self, ui: &mut egui::Ui, deck: &mut Deck) {
+        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), KNOB_ROW_H), Sense::hover());
+        let column = rect.width() / 3.0;
+        let centers = [0, 1, 2].map(|k| pos2(rect.left() + column * (k as f32 + 0.5), rect.top() + KNOB_R + 4.0));
+
+        // Volume: drag up or down, arrows when focused, double-click resets.
+        let r = knob_hit(ui, centers[0], "volume");
+        let before = self.volume;
+        if r.dragged() {
+            self.volume -= r.drag_delta().y as f64 * 0.5;
+        }
+        if r.drag_stopped() {
+            self.volume = self.volume.round();
+        }
+        if r.double_clicked() {
+            self.volume = DEFAULT_VOLUME;
+        }
+        self.volume += arrows(ui, &r) as f64 * 5.0;
+        self.volume = self.volume.clamp(0.0, 100.0);
+        if self.volume != before {
+            deck.set_volume((self.volume / 100.0) as f32);
+        }
+        let shown = self.volume.round();
+        r.widget_info(|| WidgetInfo::slider(true, shown, "Volume"));
+        let r = r.on_hover_text("Drag up or down; double-click resets.");
+        knob(ui, centers[0], (self.volume / 100.0) as f32, &format!("{shown:.0}%"), "VOLUME", r.has_focus());
+
+        // Repeat: click for the next setting, or drag through them.
+        let r = knob_hit(ui, centers[1], "repeat");
+        let at = Repeat::ALL.iter().position(|&x| x == deck.playlist.repeat).unwrap_or(0) as i32;
+        let mut step = arrows(ui, &r) + self.drag_steps(&r);
+        if r.clicked() {
+            step = if at == 2 { -2 } else { 1 };
+        }
+        let at = (at + step).clamp(0, 2);
+        deck.set_repeat(Repeat::ALL[at as usize]);
+        let repeat = deck.playlist.repeat;
+        r.widget_info(|| WidgetInfo::slider(true, at as f64, format!("Repeat {}", repeat.label())));
+        let r = r.on_hover_text("Off, one track, or the whole list. Click or drag.");
+        knob(ui, centers[1], at as f32 / 2.0, &repeat.label().to_uppercase(), "REPEAT", r.has_focus());
+
+        // Shuffle: click to flip, or drag up for on and down for off.
+        let r = knob_hit(ui, centers[2], "shuffle");
+        let step = arrows(ui, &r) + self.drag_steps(&r);
+        let on = if r.clicked() { !self.shuffle } else if step != 0 { step > 0 } else { self.shuffle };
+        if on != self.shuffle {
+            self.shuffle = on;
+            deck.playlist.set_shuffle(on);
+        }
+        r.widget_info(|| WidgetInfo::selected(Role::Switch, true, on, "Shuffle"));
+        let r = r.on_hover_text("Plays the rest of the list in random order. Click or drag.");
+        knob(ui, centers[2], if on { 1.0 } else { 0.0 }, if on { "ON" } else { "OFF" }, "SHUFFLE", r.has_focus());
+    }
+
+    /// Whole steps of drag on a stepped knob: up is +1.
+    fn drag_steps(&mut self, r: &egui::Response) -> i32 {
+        if r.drag_started() {
+            self.knob_travel = 0.0;
+        }
+        if !r.dragged() {
+            return 0;
+        }
+        self.knob_travel -= r.drag_delta().y;
+        let steps = (self.knob_travel / STEP_TRAVEL).trunc();
+        self.knob_travel -= steps * STEP_TRAVEL;
+        steps as i32
+    }
+
+    /// The playlist: number in the gutter, title and artist, length or time left.
+    fn playlist(&mut self, ui: &mut egui::Ui, deck: &mut Deck) {
+        let p = palette(ui);
+        let n = deck.playlist.tracks.len();
+        let (head, _) = ui.allocate_exact_size(vec2(ui.available_width(), 18.0), Sense::hover());
+        let g = ui.painter().layout_job(tracked("PLAYLIST", bold(10.0), 1.2, p.label));
+        ui.painter().galley(pos2(head.left(), head.center().y - g.size().y / 2.0), g, p.label);
+        let total: Duration = deck.playlist.tracks.iter().filter_map(|t| t.duration).sum();
+        let summary = match n {
+            0 => "No tracks".to_owned(),
+            1 => format!("1 track, {}", format_time(total)),
+            _ => format!("{n} tracks, {}", format_time(total)),
+        };
+        ui.painter().text(head.right_center(), Align2::RIGHT_CENTER, summary, medium(12.0), p.label);
+        ui.add_space(8.0);
+
+        // Rows reach a little into the margin, so the selection tint frames the text.
+        let rows = ui.available_rect_before_wrap().expand2(vec2(ROW_INSET, 0.0));
+        let background = ui.allocate_rect(rows.shrink2(vec2(ROW_INSET, 0.0)), Sense::click());
+        let mut action = None;
+        background.context_menu(|ui| {
+            if ui.button("Load Tracks…").clicked() {
+                action = Some(ListAction::Load);
+                ui.close();
+            }
+            if ui.add_enabled(n > 0, egui::Button::new("Clear Playlist")).clicked() {
+                action = Some(ListAction::Clear);
+                ui.close();
+            }
+        });
+
+        let mut list = ui.new_child(UiBuilder::new().max_rect(rows).layout(Layout::top_down(Align::Min)));
+        list.set_clip_rect(rows.intersect(ui.clip_rect().expand2(vec2(ROW_INSET, 0.0))));
+        let position = deck.position();
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(&mut list, ROW_H, n, |ui, range| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            for i in range {
+                let row = TrackRow {
+                    index: i,
+                    track: &deck.playlist.tracks[i],
+                    current: deck.playlist.current == Some(i),
+                    selected: self.selected == Some(i),
+                    transport: deck.transport,
+                    position,
+                };
+                if let Some(a) = track_row(ui, &row) {
+                    action = Some(a);
+                }
+            }
+        });
+
+        match action {
+            Some(ListAction::Select(i)) => self.selected = Some(i),
+            Some(ListAction::Play(i)) => {
+                self.selected = Some(i);
+                deck.play(i);
+            }
+            Some(ListAction::Remove(i)) => {
+                deck.remove(i);
+                self.selected = None;
+            }
+            Some(ListAction::Reveal(i)) => {
+                let _ = std::process::Command::new("open").arg("-R").arg(&deck.playlist.tracks[i].path).spawn();
+            }
+            Some(ListAction::Load) => self.open_dialog(deck, ui.ctx()),
+            Some(ListAction::Clear) => self.clear(deck),
+            None => {}
         }
     }
 }
@@ -608,64 +758,128 @@ fn read_meta_in_background(paths: Vec<PathBuf>, tx: Sender<(PathBuf, Meta)>, ctx
     });
 }
 
-fn screen_frame(p: &Palette, hovering: bool) -> egui::Frame {
-    let edge = if hovering { ACCENT } else { p.screen_edge };
-    egui::Frame::new()
-        .fill(p.screen)
-        .corner_radius(6)
-        .stroke(Stroke::new(if hovering { 2.0 } else { 1.0 }, edge))
-        .inner_margin(egui::Margin::symmetric(14, 10))
+const MARGIN: f32 = 24.0;
+
+/// Track numbers hang in this gutter, in the header and in the list.
+const GUTTER: f32 = 34.0;
+const TITLE: f32 = 22.0;
+const WAVE_H: f32 = 84.0;
+const BAR: f32 = 2.0;
+const BAR_GAP: f32 = 1.5;
+const DASH_W: f32 = 10.0;
+const DASH_H: f32 = 4.0;
+const DASH_GAP: f32 = 4.0;
+const DASH_ROW_GAP: f32 = 7.0;
+const ICON_BOX: egui::Vec2 = vec2(40.0, 34.0);
+const KNOB_R: f32 = 19.0;
+const KNOB_ROW_H: f32 = 90.0;
+
+/// Drag distance for one step of a stepped knob.
+const STEP_TRAVEL: f32 = 24.0;
+const ROW_H: f32 = 28.0;
+const ROW_INSET: f32 = 8.0;
+
+#[derive(Clone, Copy)]
+enum Icon {
+    Prev,
+    Play,
+    Pause,
+    Stop,
+    Next,
+    Folder,
 }
 
-/// LED segments.
-const SEGMENT: f32 = 3.0;
-const SEGMENT_GAP: f32 = 2.0;
-const STEP: f32 = SEGMENT + SEGMENT_GAP;
+/// Solid glyphs on a 20 pt square.
+fn glyph(painter: &Painter, icon: Icon, c: Pos2, color: Color32) {
+    let tri = |dir: f32, at: Pos2, w: f32, h: f32| {
+        let pts = vec![at + vec2(-dir * w / 2.0, -h / 2.0), at + vec2(dir * w / 2.0, 0.0), at + vec2(-dir * w / 2.0, h / 2.0)];
+        Shape::convex_polygon(pts, color, Stroke::NONE)
+    };
+    let block = |at: Pos2, w: f32, h: f32| Shape::rect_filled(Rect::from_center_size(at, vec2(w, h)), 0.0, color);
+    let shapes = match icon {
+        Icon::Play => vec![tri(1.0, c + vec2(1.5, 0.0), 15.0, 17.0)],
+        Icon::Pause => vec![block(c - vec2(4.5, 0.0), 4.5, 16.0), block(c + vec2(4.5, 0.0), 4.5, 16.0)],
+        Icon::Stop => vec![block(c, 14.0, 14.0)],
+        Icon::Prev => vec![block(c - vec2(7.0, 0.0), 3.0, 14.0), tri(-1.0, c + vec2(2.0, 0.0), 12.0, 14.0)],
+        Icon::Next => vec![tri(1.0, c - vec2(2.0, 0.0), 12.0, 14.0), block(c + vec2(7.0, 0.0), 3.0, 14.0)],
+        Icon::Folder => vec![block(c + vec2(0.0, 1.5), 20.0, 13.0), block(c + vec2(-6.0, -6.0), 8.0, 4.0)],
+    };
+    painter.extend(shapes);
+}
 
-/// A row of LED segments in `rect`; `color(k, count)` picks each segment's color.
-fn segments(painter: &egui::Painter, rect: Rect, color: impl Fn(usize, usize) -> Color32) {
-    let count = ((rect.width() + SEGMENT_GAP) / STEP).floor().max(1.0) as usize;
-    for k in 0..count {
-        let r = Rect::from_min_size(pos2(rect.left() + k as f32 * STEP, rect.top().round()), vec2(SEGMENT, rect.height()));
-        painter.rect_filled(r, 0.0, color(k, count));
+/// An icon button. `mark` underlines it in that color to show the deck's state.
+fn icon_button(ui: &mut egui::Ui, icon: Icon, mark: Option<Color32>, enabled: bool, tip: &str) -> bool {
+    let p = palette(ui);
+    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let (rect, response) = ui.allocate_exact_size(ICON_BOX, sense);
+    let name = tip.split(" (").next().unwrap_or(tip);
+    response.widget_info(|| WidgetInfo::labeled(Role::Button, enabled, name));
+    let painter = ui.painter();
+    let c = pos2(rect.center().x, rect.top() + 12.0);
+    let color = match (enabled, mark) {
+        (false, _) => p.dim,
+        (true, Some(m)) if m == LIVE => LIVE,
+        _ => p.ink,
+    };
+    glyph(painter, icon, c, color);
+    let line = Rect::from_center_size(pos2(c.x, rect.bottom() - 3.0), vec2(20.0, 2.5));
+    let underline = match mark {
+        Some(m) => Some(m),
+        None if enabled && response.hovered() => Some(p.dim),
+        None => None,
+    };
+    if let Some(color) = underline {
+        painter.rect_filled(line, 0.0, color);
     }
+    if response.has_focus() {
+        painter.rect_stroke(rect.shrink(1.0), 4.0, Stroke::new(1.5, p.ink), egui::StrokeKind::Inside);
+    }
+    let clicked = enabled && response.clicked();
+    response.on_hover_text(tip);
+    clicked
 }
 
-/// Level in amber up to the RMS reading, with the held peak as one bright segment.
-fn level_meter(painter: &egui::Painter, rect: Rect, rms_db: f32, peak_db: f32, p: &Palette) {
-    let at = |db: f32, count: usize| (((db - FLOOR_DB) / -FLOOR_DB) * count as f32).round() as usize;
-    segments(painter, rect, |k, count| {
-        let (lit, peak) = (at(rms_db, count), at(peak_db, count));
-        if k < lit {
-            ACCENT
-        } else if peak > 0 && k + 1 == peak {
-            p.screen_text
-        } else {
-            p.seg_off
-        }
-    });
+fn knob_hit(ui: &mut egui::Ui, c: Pos2, id: &str) -> egui::Response {
+    let rect = Rect::from_center_size(c, vec2(2.0 * KNOB_R + 16.0, 2.0 * KNOB_R + 16.0));
+    ui.interact(rect, ui.scope_id().with(("knob", id)), Sense::click_and_drag())
 }
 
-/// Played part lit grey, the playhead bright.
-fn seek_bar(painter: &egui::Painter, rect: Rect, played: f32, active: bool, p: &Palette) {
-    segments(painter, rect, |k, count| {
-        let head = (played * count as f32) as usize;
-        if !active {
-            p.seg_off
-        } else if k == head.min(count - 1) {
-            p.screen_text
-        } else if k < head {
-            p.seg_lit
-        } else {
-            p.seg_off
-        }
-    });
+/// Arrow-key steps on a focused control: up or right is +1.
+fn arrows(ui: &egui::Ui, r: &egui::Response) -> i32 {
+    if !r.has_focus() {
+        return 0;
+    }
+    ui.input(|i| {
+        let up = i.key_pressed(Key::ArrowUp) || i.key_pressed(Key::ArrowRight);
+        let down = i.key_pressed(Key::ArrowDown) || i.key_pressed(Key::ArrowLeft);
+        up as i32 - down as i32
+    })
 }
 
-const ROW_HEIGHT: f32 = 26.0;
-const NUMBER_WIDTH: f32 = 30.0;
-const LED_WIDTH: f32 = 16.0;
-const TIME_WIDTH: f32 = 84.0;
+/// A ring with an orange arc up to `t`, an ink pointer, the value in bold under it and the name under that.
+fn knob(ui: &egui::Ui, c: Pos2, t: f32, value: &str, name: &str, focused: bool) {
+    let p = palette(ui);
+    let painter = ui.painter();
+    let start = 0.75 * std::f32::consts::PI;
+    let sweep = 1.5 * std::f32::consts::PI;
+    let arc = |from: f32, to: f32| -> Vec<Pos2> {
+        let steps = ((to - from) * 24.0).ceil().max(2.0) as usize;
+        (0..=steps).map(|k| from + (to - from) * k as f32 / steps as f32).map(|a| c + KNOB_R * vec2(a.cos(), a.sin())).collect()
+    };
+    painter.add(Shape::line(arc(start, start + sweep), Stroke::new(5.0, p.dim)));
+    if t > 0.0 {
+        painter.add(Shape::line(arc(start, start + sweep * t), Stroke::new(5.0, LIVE)));
+    }
+    let a = start + sweep * t;
+    let dir = vec2(a.cos(), a.sin());
+    painter.line_segment([c - dir * 2.0, c + dir * (KNOB_R - 7.0)], Stroke::new(4.0, p.ink));
+    if focused {
+        painter.circle_stroke(c, KNOB_R + 7.0, Stroke::new(1.5, p.ink));
+    }
+    painter.text(pos2(c.x, c.y + KNOB_R + 16.0), Align2::CENTER_CENTER, value, bold(15.0), p.ink);
+    let g = painter.layout_job(tracked(name, bold(9.0), 1.2, p.label));
+    painter.galley(pos2(c.x - g.size().x / 2.0, c.y + KNOB_R + 30.0), g, p.label);
+}
 
 struct TrackRow<'a> {
     index: usize,
@@ -674,312 +888,97 @@ struct TrackRow<'a> {
     selected: bool,
     transport: Transport,
     position: Duration,
-    longest: Duration,
 }
 
-enum RowAction {
-    Select,
-    Play,
-    Remove,
-    Reveal,
+enum ListAction {
+    Select(usize),
+    Play(usize),
+    Remove(usize),
+    Reveal(usize),
+    Load,
+    Clear,
 }
 
-/// One playlist entry: number, status LED, title and artist, a meter as long as the track, its length.
-fn track_row(ui: &mut egui::Ui, row: &TrackRow<'_>) -> Option<RowAction> {
+/// One playlist row.
+fn track_row(ui: &mut egui::Ui, row: &TrackRow<'_>) -> Option<ListAction> {
     let p = palette(ui);
-    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_HEIGHT), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
     let painter = ui.painter_at(rect);
     let cy = rect.center().y;
     let t = row.track;
+    let i = row.index;
 
     if row.selected {
-        painter.rect_filled(rect, 3.0, p.row_selected);
+        painter.rect_filled(rect, 4.0, p.select);
     } else if response.hovered() {
-        painter.rect_filled(rect, 3.0, p.row_hover);
+        painter.rect_filled(rect, 4.0, p.hover);
     }
 
-    let mut x = rect.left() + 6.0;
-    painter.text(pos2(x, cy), Align2::LEFT_CENTER, format!("{:02}", row.index + 1), mono(11.0), p.screen_dim);
-    x += NUMBER_WIDTH;
-
-    // The LED glows amber while this track plays.
-    let led = match (row.current, row.transport) {
-        (true, Transport::Playing) => ACCENT,
-        (true, Transport::Paused) => p.screen_text,
-        (true, Transport::Stopped) => p.seg_lit,
-        _ => p.seg_off,
-    };
-    painter.circle_filled(pos2(x + 4.0, cy), 3.5, led);
-    x += LED_WIDTH;
-
-    let text_width = ((rect.width() - NUMBER_WIDTH - LED_WIDTH - TIME_WIDTH) * 0.55).max(140.0);
-    let title_color = if t.failed { p.screen_dim } else { p.screen_text };
-    let mut job = LayoutJob::default();
-    job.append(&t.title, 0.0, TextFormat::simple(mono(12.0), title_color));
-    if let Some(a) = &t.artist {
-        job.append(a, 12.0, TextFormat::simple(mono(12.0), p.screen_dim));
-    }
-    let g = painter.layout_job(one_line(job, text_width - 12.0));
-    painter.galley(pos2(x, cy - g.size().y / 2.0), g, title_color);
-    x += text_width;
-
-    let right = rect.right() - 6.0;
-    let meter_right = right - TIME_WIDTH;
-    if let Some(d) = t.duration.filter(|_| meter_right - x > 30.0) {
-        let width = ((meter_right - x) * d.as_secs_f32() / row.longest.as_secs_f32().max(1.0)).max(STEP * 2.0);
-        let played = if row.current && row.transport != Transport::Stopped {
-            (row.position.as_secs_f32() / d.as_secs_f32().max(1.0)).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        segments(&painter, Rect::from_min_size(pos2(x, cy - 5.0), vec2(width, 10.0)), |k, count| {
-            if (k as f32) < played * count as f32 { p.seg_lit } else { p.seg_off }
-        });
+    let x = rect.left() + ROW_INSET;
+    let number = format!("{:02}", i + 1);
+    if row.current {
+        let color = if row.transport == Transport::Playing { LIVE } else { p.ink };
+        painter.text(pos2(x, cy), Align2::LEFT_CENTER, number, bold(12.0), color);
+    } else {
+        painter.text(pos2(x, cy), Align2::LEFT_CENTER, number, medium(12.0), p.label);
     }
 
+    let right = rect.right() - ROW_INSET;
+    let running = row.current && row.transport != Transport::Stopped;
     let (status, color) = match (t.failed, t.duration) {
-        (true, _) => ("CAN'T PLAY".to_owned(), p.error),
-        (false, Some(d)) => (format_time(d), p.screen_text),
-        (false, None) => ("--:--".to_owned(), p.screen_dim),
+        (true, _) => ("Can't play".to_owned(), LIVE),
+        (false, Some(d)) if running => (format!("−{}", format_time(d.saturating_sub(row.position))), p.ink),
+        (false, Some(d)) => (format_time(d), p.label),
+        (false, None) => ("–:––".to_owned(), p.label),
     };
-    painter.text(pos2(right, cy), Align2::RIGHT_CENTER, status, mono(12.0), color);
+    let status = painter.layout_no_wrap(status, medium(12.0), color);
+    let text_left = x + GUTTER;
+    let text_width = right - status.size().x - 14.0 - text_left;
+    painter.galley(pos2(right - status.size().x, cy - status.size().y / 2.0), status, color);
+
+    let title_color = if t.failed { p.label } else { p.ink };
+    let mut job = LayoutJob::default();
+    job.append(&t.title, 0.0, TextFormat::simple(regular(14.0), title_color));
+    if let Some(a) = &t.artist {
+        job.append(a, 8.0, TextFormat::simple(regular(14.0), p.label));
+    }
+    let g = painter.layout_job(fitted(job, text_width, 1));
+    painter.galley(pos2(text_left, cy - g.size().y / 2.0), g, title_color);
 
     let mut action = None;
     if response.double_clicked() && !t.failed {
-        action = Some(RowAction::Play);
+        action = Some(ListAction::Play(i));
     } else if response.clicked() {
-        action = Some(RowAction::Select);
+        action = Some(ListAction::Select(i));
     }
     response.on_hover_text(t.path.display().to_string()).context_menu(|ui| {
         if ui.add_enabled(!t.failed, egui::Button::new("Play")).clicked() {
-            action = Some(RowAction::Play);
+            action = Some(ListAction::Play(i));
             ui.close();
         }
         if ui.button("Show in Finder").clicked() {
-            action = Some(RowAction::Reveal);
+            action = Some(ListAction::Reveal(i));
             ui.close();
         }
         ui.separator();
         if ui.button("Remove from Playlist").clicked() {
-            action = Some(RowAction::Remove);
+            action = Some(ListAction::Remove(i));
+            ui.close();
+        }
+        if ui.button("Clear Playlist").clicked() {
+            action = Some(ListAction::Clear);
             ui.close();
         }
     });
     action
 }
 
-const CONTROL_HEIGHT: f32 = 76.0;
-const LABEL_HEIGHT: f32 = 14.0;
-const KEY: f32 = 44.0;
-const KEY_GAP: f32 = 6.0;
-const TRANSPORT_WIDTH: f32 = 4.0 * KEY + 3.0 * KEY_GAP;
-const REPEAT_SEGMENT: f32 = 54.0;
-
-/// A control with its label printed under it; all labels share one baseline.
-fn control(ui: &mut egui::Ui, width: f32, label: &str, add: impl FnOnce(&mut egui::Ui)) {
-    let p = palette(ui);
-    ui.allocate_ui_with_layout(vec2(width, CONTROL_HEIGHT), Layout::top_down(Align::Center), |ui| {
-        ui.set_min_size(vec2(width, CONTROL_HEIGHT));
-        add(ui);
-        if !label.is_empty() {
-            let r = ui.max_rect();
-            let g = ui.painter().layout_job(tracked(label, din(10.0), 1.4, p.dim));
-            ui.painter().galley(pos2(r.center().x - g.size().x / 2.0, r.bottom() - LABEL_HEIGHT), g, p.dim);
-        }
-    });
-}
-
-#[derive(Clone, Copy)]
-enum KeyIcon {
-    Prev,
-    Play,
-    Pause,
-    Stop,
-    Next,
-}
-
-/// A transport key with its symbol printed on it. `lit` adds an amber lamp, as on a deck's play key.
-fn transport_key(ui: &mut egui::Ui, icon: KeyIcon, lit: bool, enabled: bool, tip: &str) -> bool {
-    let p = palette(ui);
-    let sense = if enabled { Sense::click() } else { Sense::hover() };
-    let (rect, response) = ui.allocate_exact_size(vec2(KEY, 30.0), sense);
-    let name = tip.split(" (").next().unwrap_or(tip);
-    response.widget_info(|| WidgetInfo::labeled(Role::Button, enabled, name));
-    let color = if enabled { p.ink } else { p.groove };
-    let painter = ui.painter();
-    if response.is_pointer_button_down_on() {
-        painter.rect_filled(rect, 3.0, p.groove);
-    }
-    painter.rect_stroke(rect, 3.0, Stroke::new(1.0, color), StrokeKind::Inside);
-
-    let c = rect.center();
-    let tri = |dir: f32, at: Pos2, w: f32, h: f32| {
-        let pts = vec![at + vec2(-dir * w / 2.0, -h / 2.0), at + vec2(dir * w / 2.0, 0.0), at + vec2(-dir * w / 2.0, h / 2.0)];
-        egui::Shape::convex_polygon(pts, color, Stroke::NONE)
-    };
-    let bar = |at: Pos2, h: f32| egui::Shape::rect_filled(Rect::from_center_size(at, vec2(2.5, h)), 0.0, color);
-    let shapes = match icon {
-        KeyIcon::Play => vec![tri(1.0, c + vec2(1.0, 0.0), 10.0, 12.0)],
-        KeyIcon::Pause => vec![bar(c - vec2(3.0, 0.0), 11.0), bar(c + vec2(3.0, 0.0), 11.0)],
-        KeyIcon::Stop => vec![egui::Shape::rect_filled(Rect::from_center_size(c, vec2(10.0, 10.0)), 0.0, color)],
-        KeyIcon::Prev => vec![bar(c - vec2(6.0, 0.0), 10.0), tri(-1.0, c + vec2(1.5, 0.0), 9.0, 10.0)],
-        KeyIcon::Next => vec![tri(1.0, c - vec2(1.5, 0.0), 9.0, 10.0), bar(c + vec2(6.0, 0.0), 10.0)],
-    };
-    painter.extend(shapes);
-    if lit {
-        painter.circle_filled(rect.right_top() + vec2(-6.0, 6.0), 2.5, ACCENT);
-    }
-    if response.has_focus() {
-        painter.rect_stroke(rect.expand(2.0), 4.0, Stroke::new(1.5, ACCENT), StrokeKind::Outside);
-    }
-    let clicked = enabled && response.clicked();
-    response.on_hover_text(tip);
-    clicked
-}
-
-/// A three-position switch; the selected position lights up.
-fn repeat_switch(ui: &mut egui::Ui, value: &mut Repeat) {
-    let p = palette(ui);
-    let (rect, _) = ui.allocate_exact_size(vec2(3.0 * REPEAT_SEGMENT, 24.0), Sense::hover());
-    for (i, option) in Repeat::ALL.into_iter().enumerate() {
-        let r = Rect::from_min_size(rect.min + vec2(REPEAT_SEGMENT * i as f32, 0.0), vec2(REPEAT_SEGMENT, 24.0));
-        let response = ui.interact(r, ui.scope_id().with(("repeat", i)), Sense::click());
-        if response.clicked() {
-            *value = option;
-        }
-        let on = *value == option;
-        response.widget_info(|| WidgetInfo::selected(Role::RadioButton, true, on, format!("Repeat {}", option.label())));
-
-        let painter = ui.painter();
-        if on {
-            painter.rect_filled(r.shrink(2.0), 2.0, ACCENT);
-        } else if response.hovered() {
-            painter.rect_filled(r.shrink(2.0), 2.0, p.groove);
-        }
-        if i > 0 {
-            painter.vline(r.left(), r.y_range(), Stroke::new(1.0, p.ink));
-        }
-        let text_color = if on { LIGHT.ink } else { p.ink };
-        let g = painter.layout_job(tracked(option.label().to_uppercase(), din(11.0), 1.0, text_color));
-        painter.galley(r.center() - g.size() / 2.0, g, text_color);
-        if response.has_focus() {
-            painter.rect_stroke(r.shrink(1.0), 3.0, Stroke::new(2.0, ACCENT), StrokeKind::Inside);
-        }
-    }
-    ui.painter().rect_stroke(rect, 3.0, Stroke::new(1.0, p.ink), StrokeKind::Inside);
-}
-
-/// OFF and ON printed either side of a sliding pill. Returns true when flipped.
-fn toggle_switch(ui: &mut egui::Ui, on: bool, name: &str) -> bool {
-    let p = palette(ui);
-    let (rect, response) = ui.allocate_exact_size(vec2(92.0, 20.0), Sense::click());
-    response.widget_info(|| WidgetInfo::selected(Role::Switch, true, on, name));
-    let painter = ui.painter();
-    let pill = Rect::from_center_size(rect.center(), vec2(36.0, 18.0));
-    let word = |text: &str, x: f32, align: Align2, lit: bool| {
-        painter.text(pos2(x, rect.center().y), align, text, din(10.0), if lit { p.ink } else { p.dim });
-    };
-    word("OFF", pill.left() - 8.0, Align2::RIGHT_CENTER, !on);
-    word("ON", pill.right() + 8.0, Align2::LEFT_CENTER, on);
-    painter.rect(pill, 9.0, p.groove, Stroke::new(1.0, p.ink), StrokeKind::Inside);
-    let knob_x = if on { pill.right() - 9.0 } else { pill.left() + 9.0 };
-    painter.circle_filled(pos2(knob_x, pill.center().y), 6.0, p.ink);
-    if response.has_focus() {
-        painter.rect_stroke(pill.expand(2.0), 11.0, Stroke::new(1.5, ACCENT), StrokeKind::Outside);
-    }
-    response.clicked()
-}
-
-/// An arc knob: drag up or down, arrow keys when focused, double-click to reset. Returns true on change.
-fn knob(ui: &mut egui::Ui, value: &mut f64, range: std::ops::RangeInclusive<f64>, default: f64) -> bool {
-    let p = palette(ui);
-    let before = *value;
-    let size = 42.0;
-    let (rect, response) = ui.allocate_exact_size(vec2(size, size), Sense::click_and_drag());
-    if response.dragged() {
-        *value -= response.drag_delta().y as f64 * 0.5;
-    }
-    if response.drag_stopped() {
-        *value = value.round();
-    }
-    if response.double_clicked() {
-        *value = default;
-    }
-    if response.has_focus() {
-        ui.input(|i| {
-            if i.key_pressed(Key::ArrowUp) || i.key_pressed(Key::ArrowRight) {
-                *value += 5.0;
-            }
-            if i.key_pressed(Key::ArrowDown) || i.key_pressed(Key::ArrowLeft) {
-                *value -= 5.0;
-            }
-        });
-    }
-    *value = value.clamp(*range.start(), *range.end());
-    let t = ((*value - range.start()) / (range.end() - range.start())) as f32;
-    let shown = format!("{:.0}", value.round());
-    let response = response.on_hover_text("Volume. Drag up or down; double-click resets.");
-    response.widget_info(|| WidgetInfo::slider(true, value.round(), "Volume"));
-
-    // 270° sweep with the gap at the bottom, as on a hardware pot.
-    let c = rect.center();
-    let radius = size / 2.0 - 2.0;
-    let start = 0.75 * std::f32::consts::PI;
-    let sweep = 1.5 * std::f32::consts::PI;
-    let arc = |from: f32, to: f32| -> Vec<Pos2> {
-        (0..=32).map(|k| from + (to - from) * k as f32 / 32.0).map(|a| c + radius * vec2(a.cos(), a.sin())).collect()
-    };
-    let painter = ui.painter();
-    painter.add(egui::Shape::line(arc(start, start + sweep), Stroke::new(3.0, p.groove)));
-    if t > 0.0 {
-        painter.add(egui::Shape::line(arc(start, start + sweep * t), Stroke::new(3.0, p.ink)));
-    }
-    let a = start + sweep * t;
-    let dir = vec2(a.cos(), a.sin());
-    let body = radius - 6.0;
-    painter.circle_filled(c, body, p.ink);
-    painter.line_segment([c + 0.3 * body * dir, c + (body - 2.5) * dir], Stroke::new(2.5, p.face));
-    if response.has_focus() {
-        painter.circle_stroke(c, radius + 3.0, Stroke::new(1.5, ACCENT));
-    }
-    ui.add_space(2.0);
-    ui.label(egui::RichText::new(shown).font(mono(12.0)).color(p.ink));
-    *value != before
-}
-
-/// A square hardware button with its legend printed on it.
-fn hardware_button(ui: &mut egui::Ui, legend: &str, enabled: bool, tip: &str) -> bool {
-    let p = palette(ui);
-    let sense = if enabled { Sense::click() } else { Sense::hover() };
-    let (rect, response) = ui.allocate_exact_size(vec2(64.0, 24.0), sense);
-    response.widget_info(|| WidgetInfo::labeled(Role::Button, enabled, legend));
-    let color = if enabled { p.ink } else { p.groove };
-    let painter = ui.painter();
-    if response.is_pointer_button_down_on() {
-        painter.rect_filled(rect, 3.0, p.groove);
-    }
-    painter.rect_stroke(rect, 3.0, Stroke::new(1.0, color), StrokeKind::Inside);
-    let g = painter.layout_job(tracked(legend, din(11.0), 1.2, color));
-    painter.galley(rect.center() - g.size() / 2.0, g, color);
-    if response.has_focus() {
-        painter.rect_stroke(rect.expand(2.0), 4.0, Stroke::new(1.5, ACCENT), StrokeKind::Outside);
-    }
-    let clicked = enabled && response.clicked();
-    response.on_hover_text(tip);
-    clicked
-}
-
-/// A small screen in the title strip.
-fn lcd_text(ui: &mut egui::Ui, text: &str, color: Color32, p: &Palette) {
-    let g = ui.painter().layout_job(tracked(text, mono(11.0), 1.0, color));
-    let (rect, _) = ui.allocate_exact_size(g.size() + vec2(18.0, 8.0), Sense::hover());
-    ui.painter().rect(rect, 3.0, p.screen, Stroke::new(1.0, p.screen_edge), StrokeKind::Inside);
-    ui.painter().galley(rect.center() - g.size() / 2.0, g, color);
-}
-
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        if std::mem::take(&mut self.reset_size) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(vec2(WIDTH, HEIGHT)));
+        }
         let p = palette(ui);
         let shared = self.deck.clone();
         let mut deck = shared.lock().unwrap_or_else(|e| e.into_inner());
@@ -1013,24 +1012,34 @@ impl eframe::App for App {
 
         let live = deck.transport == Transport::Playing;
         let moving = self.meters.update(deck.levels.get(), live);
+        let current = deck.playlist.current.and_then(|c| deck.playlist.tracks.get(c)).map(|t| t.path.clone());
+        let wave = current.map(|path| self.wave(&path, &ctx));
 
         // Left margin clears the traffic lights; the 32 pt strip centers on them.
-        let strip = egui::Frame::new().fill(p.face).inner_margin(egui::Margin { left: 80, right: 14, top: 4, bottom: 4 });
-        egui::Panel::top("title").frame(strip).exact_size(32.0).show(ui, |ui| self.title_strip(ui, &deck));
+        let m = MARGIN as i8;
+        let strip = egui::Frame::new().fill(p.ground).inner_margin(egui::Margin { left: 80, right: m, top: 4, bottom: 4 });
+        egui::Panel::top("title").frame(strip).exact_size(32.0).show_separator_line(false).show(ui, |ui| self.title_strip(ui, &deck));
 
-        let controls = egui::Frame::new().fill(p.face).inner_margin(egui::Margin { left: 16, right: 16, top: 12, bottom: 10 });
-        egui::Panel::bottom("controls").frame(controls).show(ui, |ui| self.control_row(ui, &mut deck));
-
-        let body = egui::Frame::new().fill(p.face).inner_margin(egui::Margin { left: 14, right: 14, top: 10, bottom: 4 });
+        let body = egui::Frame::new().fill(p.ground).inner_margin(egui::Margin { left: m, right: m, top: 14, bottom: 12 });
         egui::CentralPanel::default().frame(body).show(ui, |ui| {
-            self.display(ui, &mut deck);
-            ui.add_space(10.0);
-            self.playlist(ui, &mut deck, hovering);
+            ui.spacing_mut().item_spacing.y = 0.0;
+            self.header(ui, &deck, hovering);
+            ui.add_space(28.0);
+            self.waveform(ui, &mut deck, wave.as_deref());
+            ui.add_space(22.0);
+            self.meters(ui);
+            ui.add_space(26.0);
+            self.transport(ui, &mut deck);
+            ui.add_space(24.0);
+            self.knobs(ui, &mut deck);
+            ui.add_space(22.0);
+            self.playlist(ui, &mut deck);
         });
 
-        if moving {
+        let reading = wave.is_some_and(|w| w.state.load(Ordering::Relaxed) == READING);
+        if live || moving {
             ctx.request_repaint_after(Duration::from_millis(33));
-        } else if deck.transport != Transport::Stopped {
+        } else if reading || deck.transport != Transport::Stopped {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
     }
@@ -1043,6 +1052,7 @@ impl eframe::App for App {
             shuffle: self.shuffle,
             playlist: deck.playlist.tracks.iter().map(|t| t.path.clone()).collect(),
             current: deck.playlist.current,
+            layout: LAYOUT,
         };
         eframe::set_value(storage, eframe::APP_KEY, &prefs);
     }

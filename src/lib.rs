@@ -1,6 +1,8 @@
 //! MP3deck core: the playlist, file collection and the audio engine.
 
 pub mod audio;
+pub mod ffmpeg;
+pub mod wave;
 
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
@@ -47,22 +49,38 @@ pub struct Meta {
 }
 
 /// Reads the title, artist and length. Missing or unreadable tags give empty fields.
+/// Video files keep their file name as the title, since their tags tend to be noise.
 pub fn read_meta(path: &Path) -> Meta {
     use lofty::prelude::*;
 
-    let Ok(file) = lofty::read_from_path(path) else { return Meta::default() };
-    let tag = file.primary_tag().or_else(|| file.first_tag());
+    let video = is_video(path);
     let text = |v: Option<std::borrow::Cow<'_, str>>| v.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
-    Meta {
-        title: text(tag.and_then(|t| t.title())),
-        artist: text(tag.and_then(|t| t.artist())),
-        duration: Some(file.properties().duration()).filter(|d| !d.is_zero()),
+    let mut meta = match lofty::read_from_path(path) {
+        Ok(file) => {
+            let tag = file.primary_tag().or_else(|| file.first_tag());
+            Meta {
+                title: text(tag.and_then(|t| t.title())),
+                artist: text(tag.and_then(|t| t.artist())),
+                duration: Some(file.properties().duration()).filter(|d| !d.is_zero()),
+            }
+        }
+        Err(_) => Meta::default(),
+    };
+    if meta.duration.is_none()
+        && let Ok(p) = ffmpeg::probe(path)
+    {
+        meta = Meta { title: p.title, artist: p.artist, duration: p.duration };
     }
+    if video {
+        meta.title = None;
+        meta.artist = None;
+    }
+    meta
 }
 
-/// MP3 files among the given paths. Folders are walked recursively; hidden entries are skipped.
+/// Playable files among the given paths. Folders are walked recursively; hidden entries are skipped.
 /// Each folder's files come out in natural order, so "2 Song" sorts before "10 Song".
-pub fn collect_mp3s(paths: &[PathBuf]) -> Vec<PathBuf> {
+pub fn collect_tracks(paths: &[PathBuf]) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for p in paths {
         if p.is_dir() {
@@ -70,7 +88,7 @@ pub fn collect_mp3s(paths: &[PathBuf]) -> Vec<PathBuf> {
             walk(p, &mut found);
             found.sort_by(|a, b| natural_cmp(&a.to_string_lossy(), &b.to_string_lossy()));
             out.extend(found);
-        } else if is_mp3(p) {
+        } else if is_playable(p) {
             out.push(p.clone());
         }
     }
@@ -86,14 +104,25 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
         }
         match entry.file_type() {
             Ok(t) if t.is_dir() => walk(&path, out),
-            Ok(t) if t.is_file() && is_mp3(&path) => out.push(path),
+            Ok(t) if t.is_file() && is_playable(&path) => out.push(path),
             _ => {}
         }
     }
 }
 
-fn is_mp3(path: &Path) -> bool {
-    path.extension().is_some_and(|e| e.eq_ignore_ascii_case("mp3"))
+/// MP3s, plus the audio of MP4 and MKV files.
+pub const EXTENSIONS: [&str; 7] = ["mp3", "m4a", "mp4", "m4v", "mov", "mkv", "webm"];
+
+fn extension(path: &Path) -> String {
+    path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default()
+}
+
+pub fn is_playable(path: &Path) -> bool {
+    EXTENSIONS.contains(&extension(path).as_str())
+}
+
+pub fn is_video(path: &Path) -> bool {
+    ["mp4", "m4v", "mov", "mkv", "webm"].contains(&extension(path).as_str())
 }
 
 /// Compares strings with runs of digits compared as numbers.
