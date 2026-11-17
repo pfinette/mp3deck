@@ -1,0 +1,31 @@
+[package]
+name = "mp3deck"
+version = "0.1.0"
+edition = "2024"
+description = "A small MP3 player that looks like a tape deck."
+publish = false
+
+[lib]
+name = "mp3deck"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mp3deck"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.37", features = ["persistence"] }
+lofty = "0.25"
+rfd = "0.18"
+rodio = { version = "0.23", default-features = false, features = ["playback", "mp3"] }
+serde = { version = "1", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[profile.dev]
+
+# Debug builds of the MP3 decoder can't keep up with playback.
+opt-level = 2
