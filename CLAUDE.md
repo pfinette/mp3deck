@@ -19,7 +19,7 @@ uv run --with pillow --with numpy python scripts/icon.py assets/icon.png   # red
 | `src/lib.rs` | `Track`, `read_meta` (lofty, then ffprobe), `collect_tracks`, `EXTENSIONS`, `natural_cmp`, `format_time`, `Repeat`, `Playlist` (order, shuffle, next/prev) |
 | `src/audio.rs` | `Levels` + `Metered` (level meter on the signal path), `open_output`, `open_track`, `Deck` (playlist + player + transport) |
 | `src/ffmpeg.rs` | `FfmpegSource`: an `ffmpeg` process piping 48 kHz stereo f32, decoded ahead on a reader thread; `probe` (ffprobe) |
-| `src/main.rs` | eframe app: palettes and fonts, title strip, header, waveform, level dashes, transport icons, three knobs, playlist, persisted prefs |
+| `src/main.rs` | eframe app: palettes and fonts, title strip, then two columns (header, VU dials, transport / playlist, knobs) over a full-width waveform, persisted prefs |
 | `src/wave.rs` | `analyze`: RMS of every 50 ms, mixed to mono, appended as it is read (native decoder, or ffmpeg at 8 kHz) |
 | `scripts/icon.py` | Draws `assets/icon.png` |
 | `bundle.sh` | Builds the .app; makes the .icns with `sips` + `iconutil` |
@@ -43,7 +43,7 @@ uv run --with pillow --with numpy python scripts/icon.py assets/icon.png   # red
 - Video files keep their file name as the title; their tags are usually noise.
 - The current track's waveform is read on a background thread into an `Arc<Wave>`, cached per path. Starting a new job bumps `wave_job`, which stops older ones. An hour of Opus takes about 7 s, so the bars fill in left to right.
 - Each bar is the loudest 50 ms window it covers, scaled to the track's loudest window. Unread bars are dots.
-- The level dashes show RMS from −48 to 0 dBFS, rise at once and fall 26 dB/s. The held peak dash is orange.
+- The VU dials show RMS with 0 VU at −10 dBFS on a −20 to +3 VU scale, eased with a 90 ms time constant. They are drawn like the knobs: a grey arc, an orange arc up to the level, an ink needle.
 - A file that won't decode is marked `failed` and skipped.
 
 ## Gotchas
@@ -55,4 +55,4 @@ uv run --with pillow --with numpy python scripts/icon.py assets/icon.png   # red
 - `LAYOUT` in `main.rs` is saved in prefs. Bump it when the default window size changes, so an older saved size is replaced once.
 - `ffmpeg` and `ffprobe` are looked up in `/opt/homebrew/bin`, `/usr/local/bin`, then `PATH`, because apps opened from Finder get a bare `PATH`.
 - eframe stores state under `~/Library/Application Support/MP3deck/`. A different app name gets its own folder, with spaces turned into hyphens.
-- Screenshots: build a scratch copy under another app name, seed its `app.ron` with `volume:0.0` so nothing is audible, and capture with `screencapture -l` on the 432-pt-wide window (the process also owns a hidden 500×500 window). A covered window stops repainting, so a capture shows its last painted frame. Simulated keystrokes go to whatever app is frontmost, so avoid them.
+- Screenshots: build a scratch copy under another app name, seed its `app.ron` with `volume:0.0` so nothing is audible, and capture with `screencapture -l` on the 880-pt-wide main window (the process also owns a hidden 500×500 window). A covered window stops repainting, so a capture shows its last painted frame; wrapping the scratch build in a .app and launching it with `open` brings it to the front. Simulated keystrokes go to whatever app is frontmost, so avoid them.

@@ -14,16 +14,16 @@ use mp3deck::audio::{Deck, Transport, open_output};
 use mp3deck::{EXTENSIONS, Meta, Repeat, collect_tracks, format_time, read_meta, wave};
 use serde::{Deserialize, Serialize};
 
-const WIDTH: f32 = 432.0;
-const HEIGHT: f32 = 720.0;
+const WIDTH: f32 = 880.0;
+const HEIGHT: f32 = 540.0;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("MP3deck")
             .with_inner_size([WIDTH, HEIGHT])
-            .with_min_inner_size([WIDTH, 620.0])
-            .with_max_inner_size([640.0, 1600.0])
+            .with_min_inner_size([800.0, 500.0])
+            .with_max_inner_size([1400.0, 1000.0])
             .with_drag_and_drop(true)
             .with_fullsize_content_view(true)
             .with_titlebar_shown(false)
@@ -142,7 +142,7 @@ fn install_style(ctx: &egui::Context) {
 }
 
 /// Bumped when the default window size changes, so an old saved size is replaced once.
-const LAYOUT: u32 = 3;
+const LAYOUT: u32 = 4;
 
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
@@ -163,54 +163,38 @@ impl Default for Prefs {
     }
 }
 
-/// Meter readings as shown, in dBFS. They read the music before the volume knob, rise at once and
-/// fall slowly, and hold the peak for a moment. `clip` counts down while the signal sits at full scale.
+/// 0 VU sits at −10 dBFS RMS, so loud modern masters swing the needles around zero.
+const VU_REF_DBFS: f32 = -10.0;
+
+/// Needle time constant. A VU needle takes about 300 ms to settle.
+const VU_TAU_S: f32 = 0.09;
+
+/// Where a level in VU falls on the scale, from 0 (−20 VU) to 1 (+3 VU). The scale is linear in
+/// amplitude, which crowds the low end, as on a real VU meter.
+fn vu_pos(vu: f32) -> f32 {
+    let (lo, hi) = (0.1, 10f32.powf(3.0 / 20.0));
+    ((10f32.powf(vu / 20.0) - lo) / (hi - lo)).clamp(0.0, 1.0)
+}
+
+/// Needle positions, left and right. They read the music before the volume knob.
 #[derive(Default)]
 struct Meters {
-    rms: [f32; 2],
-    peak: [f32; 2],
-    peak_age: [f32; 2],
-    clip: [f32; 2],
+    needle: [f32; 2],
     last: Option<Instant>,
 }
 
-const FLOOR_DB: f32 = -48.0;
-const FALL_DB_PER_S: f32 = 26.0;
-const PEAK_HOLD_S: f32 = 0.4;
-
-/// Full scale, give or take rounding in the decoder.
-const CLIP: f32 = 0.999;
-const CLIP_HOLD_S: f32 = 0.5;
-
-fn to_db(amplitude: f32) -> f32 {
-    if amplitude <= 1e-6 { FLOOR_DB } else { (20.0 * amplitude.log10()).clamp(FLOOR_DB, 0.0) }
-}
-
 impl Meters {
-    fn new() -> Self {
-        Self { rms: [FLOOR_DB; 2], peak: [FLOOR_DB; 2], ..Default::default() }
-    }
-
-    /// Moves toward the latest levels. Returns true while anything is still moving.
+    /// Moves toward the latest levels. Returns true while a needle is still moving.
     fn update(&mut self, levels: [(f32, f32); 2], live: bool) -> bool {
         let now = Instant::now();
         let dt = self.last.map_or(0.0, |t| (now - t).as_secs_f32().min(0.1));
         self.last = Some(now);
-        for (ch, (rms, peak)) in levels.into_iter().enumerate() {
-            self.clip[ch] = if live && peak >= CLIP { CLIP_HOLD_S } else { (self.clip[ch] - dt).max(0.0) };
-            let (rms, peak) = if live { (to_db(rms), to_db(peak)) } else { (FLOOR_DB, FLOOR_DB) };
-            self.rms[ch] = if rms > self.rms[ch] { rms } else { (self.rms[ch] - FALL_DB_PER_S * dt).max(rms) };
-            if peak >= self.peak[ch] {
-                self.peak[ch] = peak;
-                self.peak_age[ch] = 0.0;
-            } else {
-                self.peak_age[ch] += dt;
-                if self.peak_age[ch] > PEAK_HOLD_S {
-                    self.peak[ch] = (self.peak[ch] - FALL_DB_PER_S * dt).max(FLOOR_DB);
-                }
-            }
+        let follow = 1.0 - (-dt / VU_TAU_S).exp();
+        for (ch, (rms, _)) in levels.into_iter().enumerate() {
+            let target = if live && rms > 1e-6 { vu_pos(20.0 * rms.log10() - VU_REF_DBFS) } else { 0.0 };
+            self.needle[ch] += (target - self.needle[ch]) * follow;
         }
-        live || self.rms.iter().chain(&self.peak).any(|&db| db > FLOOR_DB) || self.clip.iter().any(|&c| c > 0.0)
+        live || self.needle.iter().any(|&n| n > 0.002)
     }
 }
 
@@ -288,7 +272,7 @@ impl App {
             meta_tx,
             meta_rx,
             selected: None,
-            meters: Meters::new(),
+            meters: Meters::default(),
             waves: HashMap::new(),
             wave_job: Arc::default(),
             scrub: None,
@@ -529,33 +513,13 @@ impl App {
         }
     }
 
-    /// Left and right levels as rows of dashes: ink up to the average level, grey up to the peak,
-    /// and the top dash orange while the signal hits full scale.
-    fn meters(&self, ui: &mut egui::Ui) {
-        let p = palette(ui);
-        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 2.0 * DASH_H + DASH_ROW_GAP), Sense::hover());
-        let painter = ui.painter();
-        let left = rect.left() + GUTTER;
-        let count = ((rect.right() - left + DASH_GAP) / (DASH_W + DASH_GAP)).floor() as usize;
-        let at = |db: f32| (((db - FLOOR_DB) / -FLOOR_DB) * count as f32).round() as usize;
-        for (ch, name) in ["L", "R"].into_iter().enumerate() {
-            let y = rect.top() + ch as f32 * (DASH_H + DASH_ROW_GAP);
-            painter.text(pos2(rect.left(), y + DASH_H / 2.0), Align2::LEFT_CENTER, name, bold(9.0), p.label);
-            let (lit, peak) = (at(self.meters.rms[ch]), at(self.meters.peak[ch]));
-            let clipping = self.meters.clip[ch] > 0.0;
-            for k in 0..count {
-                let color = if clipping && k + 1 == count {
-                    LIVE
-                } else if k < lit {
-                    p.ink
-                } else if k < peak {
-                    p.label
-                } else {
-                    p.dim
-                };
-                let x = left + k as f32 * (DASH_W + DASH_GAP);
-                painter.rect_filled(Rect::from_min_size(pos2(x, y), vec2(DASH_W, DASH_H)), 0.0, color);
-            }
+    /// Left and right VU dials, side by side in the space they are given.
+    fn vu_meters(&self, ui: &mut egui::Ui) {
+        let rect = ui.available_rect_before_wrap();
+        let w = rect.width() / 2.0;
+        for (ch, name) in ["LEFT", "RIGHT"].into_iter().enumerate() {
+            let r = Rect::from_min_size(rect.min + vec2(ch as f32 * w, 0.0), vec2(w, rect.height()));
+            vu_dial(ui, r, self.meters.needle[ch], name);
         }
     }
 
@@ -779,13 +743,13 @@ const MARGIN: f32 = 24.0;
 /// Track numbers hang in this gutter, in the header and in the list.
 const GUTTER: f32 = 34.0;
 const TITLE: f32 = 22.0;
-const WAVE_H: f32 = 84.0;
+const WAVE_H: f32 = 72.0;
+
+/// Space between the two columns, and between them and the waveform.
+const COLUMN_GAP: f32 = 44.0;
+const BLOCK_GAP: f32 = 28.0;
 const BAR: f32 = 2.0;
 const BAR_GAP: f32 = 1.5;
-const DASH_W: f32 = 10.0;
-const DASH_H: f32 = 4.0;
-const DASH_GAP: f32 = 4.0;
-const DASH_ROW_GAP: f32 = 7.0;
 const ICON_BOX: egui::Vec2 = vec2(40.0, 34.0);
 const KNOB_R: f32 = 19.0;
 const KNOB_ROW_H: f32 = 90.0;
@@ -895,6 +859,47 @@ fn knob(ui: &egui::Ui, c: Pos2, t: f32, value: &str, name: &str, focused: bool) 
     painter.text(pos2(c.x, c.y + KNOB_R + 16.0), Align2::CENTER_CENTER, value, bold(15.0), p.ink);
     let g = painter.layout_job(tracked(name, bold(9.0), 1.2, p.label));
     painter.galley(pos2(c.x - g.size().x / 2.0, c.y + KNOB_R + 30.0), g, p.label);
+}
+
+/// A VU meter in the knobs' terms: a grey arc, an orange arc up to the level, an ink needle on a
+/// pivot, and a sparse scale. The music turns it.
+fn vu_dial(ui: &egui::Ui, r: Rect, needle: f32, name: &str) {
+    let p = palette(ui);
+    let painter = ui.painter();
+    let half: f32 = 0.87;
+
+    // Sized to leave room for the scale labels at the sides, then centered in the space.
+    let (above, below) = (32.0, 30.0);
+    let radius = ((r.width() / 2.0 - 44.0) / half.sin()).min(r.height() - above - below).max(20.0);
+    let pivot = pos2(r.center().x, r.center().y + (radius + above - below) / 2.0);
+    let name_y = pivot.y + below;
+    let at = |pos: f32, rad: f32| {
+        let a = -half + 2.0 * half * pos;
+        pivot + rad * vec2(a.sin(), -a.cos())
+    };
+    let arc = |from: f32, to: f32| -> Vec<Pos2> {
+        let steps = ((to - from) * 48.0).ceil().max(2.0) as usize;
+        (0..=steps).map(|k| at(from + (to - from) * k as f32 / steps as f32, radius)).collect()
+    };
+
+    painter.add(Shape::line(arc(0.0, 1.0), Stroke::new(5.0, p.dim)));
+    if needle > 0.002 {
+        painter.add(Shape::line(arc(0.0, needle), Stroke::new(5.0, LIVE)));
+    }
+    for (vu, label) in [(-20.0, "−20"), (-10.0, "−10"), (-7.0, ""), (-5.0, "−5"), (-3.0, ""), (-2.0, ""), (-1.0, ""), (0.0, "0"), (1.0, ""), (2.0, ""), (3.0, "+3")] {
+        let pos = vu_pos(vu);
+        let color = if vu >= 0.0 { p.ink } else { p.label };
+        let long = if label.is_empty() { 4.0 } else { 7.0 };
+        painter.line_segment([at(pos, radius + 6.0), at(pos, radius + 6.0 + long)], Stroke::new(1.5, color));
+        if !label.is_empty() {
+            painter.text(at(pos, radius + 22.0), Align2::CENTER_CENTER, label, bold(9.0), color);
+        }
+    }
+
+    painter.line_segment([pivot, at(needle, radius - 8.0)], Stroke::new(3.0, p.ink));
+    painter.circle_filled(pivot, 4.5, p.ink);
+    let g = painter.layout_job(tracked(name, bold(9.0), 1.2, p.label));
+    painter.galley(pos2(r.center().x - g.size().x / 2.0, name_y - g.size().y), g, p.label);
 }
 
 struct TrackRow<'a> {
@@ -1039,17 +1044,33 @@ impl eframe::App for App {
         let body = egui::Frame::new().fill(p.ground).inner_margin(egui::Margin { left: m, right: m, top: 14, bottom: 12 });
         egui::CentralPanel::default().frame(body).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
-            self.header(ui, &deck, hovering);
-            ui.add_space(28.0);
-            self.waveform(ui, &mut deck, wave.as_deref());
-            ui.add_space(22.0);
-            self.meters(ui);
-            ui.add_space(26.0);
-            self.transport(ui, &mut deck);
-            ui.add_space(24.0);
-            self.knobs(ui, &mut deck);
-            ui.add_space(22.0);
-            self.playlist(ui, &mut deck);
+
+            // Two columns over a full-width waveform: the track, its dials and the transport on the
+            // left; the playlist and the knobs on the right.
+            let full = ui.max_rect();
+            let bottom = Rect::from_min_max(pos2(full.left(), full.bottom() - WAVE_H - 24.0), full.max);
+            let top = Rect::from_min_max(full.min, pos2(full.right(), bottom.top() - BLOCK_GAP));
+            let column = (top.width() - COLUMN_GAP) / 2.0;
+            let left = Rect::from_min_size(top.min, vec2(column, top.height()));
+            let right = Rect::from_min_max(pos2(left.right() + COLUMN_GAP, top.top()), top.max);
+            let region = |ui: &mut egui::Ui, rect: Rect| {
+                let mut child = ui.new_child(UiBuilder::new().max_rect(rect).layout(Layout::top_down(Align::Min)));
+                child.spacing_mut().item_spacing.y = 0.0;
+                child
+            };
+
+            let mut l = region(ui, left);
+            self.header(&mut l, &deck, hovering);
+            let keys = Rect::from_min_max(pos2(left.left(), left.bottom() - ICON_BOX.y), left.max);
+            let dials = Rect::from_min_max(pos2(left.left(), l.cursor().top() + 20.0), pos2(left.right(), keys.top() - 16.0));
+            self.vu_meters(&mut region(ui, dials));
+            self.transport(&mut region(ui, keys), &mut deck);
+
+            let knobs = Rect::from_min_max(pos2(right.left(), right.bottom() - KNOB_ROW_H), right.max);
+            self.playlist(&mut region(ui, right.with_max_y(knobs.top() - 20.0)), &mut deck);
+            self.knobs(&mut region(ui, knobs), &mut deck);
+
+            self.waveform(&mut region(ui, bottom), &mut deck, wave.as_deref());
         });
 
         let reading = wave.is_some_and(|w| w.state.load(Ordering::Relaxed) == READING);

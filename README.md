@@ -22,6 +22,7 @@ Personal use only. Not distributed or notarized.
 | Click or drag the waveform | Jump |
 
 - The waveform shows the whole track: ink for what has played, grey for what's to come, the orange line for now. Click or drag it to jump. Long files fill it in as they are read.
+- Two VU dials show the left and right level, read before the volume knob.
 - VOLUME is a knob; drag up or down. REPEAT and SHUFFLE are knobs too: click for the next setting, or drag.
 - The window follows the system's light or dark mode.
 - REPEAT is OFF, ONE or ALL. SHUFFLE plays the rest of the list at random, starting from the current track.
