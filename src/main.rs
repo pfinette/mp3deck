@@ -479,7 +479,8 @@ impl App {
         let played = duration.map_or(0.0, |d| (position.as_secs_f32() / d.as_secs_f32()).clamp(0.0, 1.0));
 
         // One bar per few points, each the loudest stretch it covers. Bars not read yet are dots.
-        let windows = wave.map(|w| w.windows.lock().map(|v| v.clone()).unwrap_or_default()).unwrap_or_default();
+        let guard = wave.map(|w| w.windows.lock().unwrap_or_else(|e| e.into_inner()));
+        let windows: &[f32] = guard.as_deref().map_or(&[], Vec::as_slice);
         let expected = duration.map_or(windows.len(), |d| (d.as_secs_f32() * wave::RATE as f32).ceil() as usize).max(1);
         let loudest = windows.iter().copied().fold(0.0f32, f32::max).max(1e-4);
         let count = ((rect.width() + BAR_GAP) / (BAR + BAR_GAP)).floor() as usize;
@@ -757,6 +758,9 @@ fn read_meta_in_background(paths: Vec<PathBuf>, tx: Sender<(PathBuf, Meta)>, ctx
         ctx.request_repaint();
     });
 }
+
+/// Redrawing is most of the app's CPU while playing; 20 fps keeps the meters smooth.
+const FRAME: Duration = Duration::from_millis(50);
 
 const MARGIN: f32 = 24.0;
 
@@ -1038,7 +1042,7 @@ impl eframe::App for App {
 
         let reading = wave.is_some_and(|w| w.state.load(Ordering::Relaxed) == READING);
         if live || moving {
-            ctx.request_repaint_after(Duration::from_millis(33));
+            ctx.request_repaint_after(FRAME);
         } else if reading || deck.transport != Transport::Stopped {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
