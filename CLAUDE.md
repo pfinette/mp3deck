@@ -1,6 +1,8 @@
 # MP3deck
 
-Personal ARM-native macOS MP3 player in Rust and egui, styled after fm1-sampler's phone deck (https://github.com/ferluht/fm1-sampler): one flat ground, ink, a dim tone, and one orange for what is live. It also plays the audio of MP4 and MKV files. Not distributed or notarized.
+ARM-native macOS MP3 player, published at github.com/pfinette/mp3deck, in Rust and egui, styled after fm1-sampler's phone deck (https://github.com/ferluht/fm1-sampler): one flat ground, ink, a dim tone, and one orange for what is live. It also plays the audio of MP4 and MKV files.
+
+Distributed as an ad-hoc-signed, unnotarized .app zip on GitHub Releases. Own code is MIT; Symphonia is MPL-2.0. See README for install steps and the license notice.
 
 ## Commands
 
@@ -22,14 +24,15 @@ uv run --with pillow --with numpy python scripts/icon.py assets/icon.png   # red
 | `src/main.rs` | eframe app: palettes and fonts, title strip, then two columns (header, VU dials, transport / playlist, knobs) over a full-width waveform, persisted prefs |
 | `src/wave.rs` | `analyze`: RMS of every 50 ms, mixed to mono, appended as it is read (native decoder, or ffmpeg at 8 kHz) |
 | `scripts/icon.py` | Draws `assets/icon.png` |
-| `bundle.sh` | Builds the .app; makes the .icns with `sips` + `iconutil` |
+| `bundle.sh` | Builds the .app; makes the .icns with `sips` + `iconutil`; copies LICENSE and THIRD_PARTY_LICENSES |
+| `about.toml`, `about.hbs` | cargo-about config. `cargo about generate about.hbs -o THIRD_PARTY_LICENSES` after any dependency change |
 
 ## Stack
 
 | Crate | Version | Notes |
 |---|---|---|
 | eframe / egui | 0.37 | `App::ui`, `egui::Panel::top/bottom`, `persistence` on |
-| rodio | 0.23 | Default features off; `playback`, `mp3`, `mp4` (symphonia). `Player` was `Sink` in older versions |
+| rodio | 0.23 | Default features off; `playback`, `mp3`, `mp4` (symphonia, MPL-2.0). `Player` was `Sink` in older versions |
 | lofty | 0.25 | Title, artist, duration |
 | rfd | 0.18 | Open dialog |
 
