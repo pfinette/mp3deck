@@ -11,6 +11,7 @@ APP="target/MP3deck.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp target/release/mp3deck "$APP/Contents/MacOS/MP3deck"
+cp LICENSE THIRD_PARTY_LICENSES "$APP/Contents/Resources/"
 
 # Icon: 1024 px PNG -> .icns
 ICONSET="target/MP3deck.iconset"
@@ -44,7 +45,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-# Ad-hoc signature; enough to run locally on Apple Silicon.
+# Ad-hoc signature. The app is not notarized, so Gatekeeper blocks the first
+# launch of a downloaded copy until the user allows it.
 codesign --force --deep --sign - "$APP"
 
 echo "Built $APP"

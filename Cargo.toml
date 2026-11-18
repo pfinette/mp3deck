@@ -3,6 +3,8 @@ name = "mp3deck"
 version = "0.1.0"
 edition = "2024"
 description = "A small MP3 player that looks like a tape deck."
+license = "MIT"
+repository = "https://github.com/pfinette/mp3deck"
 publish = false
 
 [lib]
