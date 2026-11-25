@@ -1,6 +1,6 @@
 [package]
 name = "mp3deck"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "A small MP3 player that looks like a tape deck."
 license = "MIT"
