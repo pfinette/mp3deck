@@ -27,7 +27,8 @@ fn main() -> eframe::Result {
             .with_drag_and_drop(true)
             .with_fullsize_content_view(true)
             .with_titlebar_shown(false)
-            .with_title_shown(false),
+            .with_title_shown(false)
+            .with_icon(egui::IconData::default()),
         ..Default::default()
     };
     eframe::run_native("MP3deck", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
