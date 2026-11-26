@@ -64,7 +64,7 @@ Needs Rust (`rustup`) and the Xcode command-line tools (`xcode-select --install`
 git clone https://github.com/pfinette/mp3deck.git
 cd mp3deck
 ./bundle.sh            # builds target/MP3deck.app
-./bundle.sh --install  # also copies it to /Applications
+./bundle.sh --install  # also copies it to /Applications/Werkzeuge
 ```
 
 `bundle.sh` signs the app ad hoc, which is enough to run a copy you built yourself. `cargo test` runs the playlist, meter and decode tests. The Opus-in-MKV test needs `ffmpeg`.

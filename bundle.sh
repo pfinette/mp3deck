@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Build MP3deck.app. Pass --install to copy it into /Applications.
+# Build MP3deck.app. Pass --install to copy it into /Applications/Werkzeuge (set APPS_DIR to change).
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -52,7 +52,9 @@ codesign --force --deep --sign - "$APP"
 echo "Built $APP"
 
 if [[ "${1:-}" == "--install" ]]; then
-  rm -rf "/Applications/MP3deck.app"
-  cp -R "$APP" /Applications/
-  echo "Installed to /Applications/MP3deck.app"
+  APPS_DIR="${APPS_DIR:-/Applications/Werkzeuge}"
+  mkdir -p "$APPS_DIR"
+  rm -rf "$APPS_DIR/MP3deck.app"
+  cp -R "$APP" "$APPS_DIR/"
+  echo "Installed to $APPS_DIR/MP3deck.app"
 fi

@@ -8,7 +8,7 @@ Distributed as an ad-hoc-signed, unnotarized .app zip on GitHub Releases. Own co
 
 ```sh
 ./bundle.sh              # release build -> target/MP3deck.app (icon, Info.plist, ad-hoc codesign)
-./bundle.sh --install    # also copies to /Applications
+./bundle.sh --install    # also copies to /Applications/Werkzeuge
 cargo test               # playlist logic, level meter, pause/resume, Opus-in-MKV decode and seek
 cargo clippy --all-targets
 uv run --with pillow --with numpy python scripts/icon.py assets/icon.png   # redraw the icon
